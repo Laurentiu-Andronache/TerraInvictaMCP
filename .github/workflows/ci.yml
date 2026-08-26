@@ -1,0 +1,75 @@
+# Offline checks only. The DLL builds against the game's own assemblies, which
+# cannot be redistributed, so there is no build here; see "Building from
+# source" in README.md. Everything below runs with no game and no bridge.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline:
+    name: offline checks (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.7 is the floor README.md states; 3.x is whatever is current.
+          - { os: ubuntu-22.04,   python: "3.7" }
+          - { os: ubuntu-latest,  python: "3.x" }
+          - { os: windows-latest, python: "3.x" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: version agreement
+        shell: python
+        run: |
+          # ModInfo.json, Verbs.ModVersion and SERVER_INFO move together; a
+          # wire-contract change is a mod version bump (docs/CONTRIBUTING.md).
+          import json, re, sys
+          mod = json.load(open("ModInfo.json", encoding="utf-8"))["Version"]
+          cs = re.search(r'ModVersion\s*=\s*"([^"]+)"', open("src/Verbs.cs", encoding="utf-8").read()).group(1)
+          py = re.search(r'SERVER_INFO\s*=\s*\{[^}]*"version":\s*"([^"]+)"', open("server/__main__.py", encoding="utf-8").read()).group(1)
+          print("ModInfo.json %s, src/Verbs.cs %s, server/__main__.py %s" % (mod, cs, py))
+          sys.exit(0 if mod == cs == py else 1)
+
+      - name: no stray .json
+        shell: python
+        run: |
+          # The game's Mod Manager parses every .json under a mod folder as a
+          # template array; ModInfo.json is the only one allowed.
+          import os, sys
+          stray = [os.path.join(d, f) for d, _, fs in os.walk(".") for f in fs
+                   if f.lower().endswith(".json") and not d.startswith("./.git")
+                   and os.path.join(d, f) != os.path.join(".", "ModInfo.json")]
+          print("\n".join(stray) or "only ModInfo.json")
+          sys.exit(1 if stray else 0)
+
+      - name: stdout hygiene
+        run: python server/stdio_selfcheck.py
+
+      - name: modcheck unit tests
+        run: python -m unittest discover -s server/tests
+
+      - name: shell scripts parse
+        if: runner.os == 'Linux'
+        run: |
+          bash -n install.sh && bash -n build.sh && bash -n release.sh
+          ./install.sh --help >/dev/null
+          ./build.sh --help >/dev/null
+          ./release.sh --help >/dev/null
+
+      - name: PowerShell scripts parse
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File install.ps1 -Help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File build.ps1 -Help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }

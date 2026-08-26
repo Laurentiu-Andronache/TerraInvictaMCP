@@ -1,0 +1,799 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using Newtonsoft.Json.Linq;
+using PavonisInteractive.TerraInvicta;
+
+namespace TerraInvictaMCP
+{
+    // faction.diplomacy.
+    //
+    // The five policy options whose HandledAtFactionLevel is true -- ProposeAlliance,
+    // EndAlliance, InitiateRivalry, EndRivalry, EmployNuclearWeapons -- are the whole
+    // set nation.set_policy refuses, and this is the only contracted verb that reaches
+    // them. Not the only reach: action.invoke can construct ConfirmPolicyAction with any
+    // registered option by data name, which enacts it with no cost, no eligibility check
+    // and no confirm. That layer is fixture-grade and legality-bypassing by design, the
+    // same as the spawn verbs; this one is the gated path.
+    //
+    // ConfirmPolicyAction.Execute, the wrapper the two other call sites use, is a bare
+    // `policy.OnConfirm(nation, target)` with no Allowed() re-check, and it returns
+    // immediately afterwards for a HandledAtFactionLevel option. So nothing downstream
+    // enforces legality and the gates below are the only guardrail -- the same discipline
+    // RequirePolicyOffered applies in Policy.cs, applied here against each option's own
+    // eligible list.
+    public static partial class Verbs
+    {
+        // TIRegionState.NuclearAttackOnRegion schedules the damage event at
+        // currentTime + 1800 seconds; the launch itself is immediate and nothing in
+        // the engine cancels the queued event.
+        const double NuclearArrivalDelaySeconds = 1800.0;
+
+        // The label TINationState.HandleFactionLevelRelationshipChanges passes to
+        // PayCost, so the faction's resource log reads the same either way.
+        const string RelationshipCostLabel = "Relationship Change";
+
+        #region entry
+
+        static JToken FactionDiplomacy(JObject args)
+        {
+            TINationState nation = ArgNation(args, "nation");
+            string name = Str(args, "option");
+            if (name != null) name = name.Trim();
+            if (string.IsNullOrEmpty(name)) return DiplomacyList(nation);
+            return DiplomacyEnact(args, nation, ArgDiplomacyOption(name));
+        }
+
+        #endregion
+
+        #region list mode
+
+        static JToken DiplomacyList(TINationState nation)
+        {
+            List<TIPolicyOption> options = FactionLevelOptions();
+            TIFactionState faction = ExecutiveFaction(nation);
+            TIResourcesCost cost = RelationshipChangeCost();
+            JToken payable = CostPayable(cost, faction);
+
+            var o = new JObject();
+            o["nation"] = Describe(nation);
+            o["executiveFaction"] = faction != null ? Describe(faction) : JValue.CreateNull();
+            o["cost"] = cost != null ? CostToken(cost) : JValue.CreateNull();
+            o["costPayable"] = payable;
+            o["holdings"] = ResourceSnapshot(cost, faction);
+            Put(o, "nuclearWeapons", delegate { return (JToken)nation.numNuclearWeapons; });
+            o["optionCount"] = options.Count;
+            string audit = DiplomacyAudit();
+            o["optionsAudit"] = audit != null ? (JToken)new JValue(audit) : JValue.CreateNull();
+
+            var rows = new JArray();
+            for (int i = 0; i < options.Count; i++)
+            {
+                TIPolicyOption policy = options[i];
+                JObject row = DescribeDiplomacyOption(policy);
+                row["allowed"] = Safe<JToken>(
+                    delegate { return (JToken)policy.Allowed(nation); }, JValue.CreateNull());
+
+                IList<TIGameState> possible = Safe<IList<TIGameState>>(
+                    delegate { return policy.GetPossibleTargets(nation); }, null);
+                row["targetCount"] = possible != null ? possible.Count : -1;
+                var targets = new JArray();
+                for (int j = 0; possible != null && j < possible.Count
+                        && j < MaxPolicyTargets; j++)
+                {
+                    if (possible[j] == null) continue;
+                    targets.Add(DiplomacyTargetToken(possible[j]));
+                }
+                row["targets"] = targets;
+                row["costPayable"] = IsRelationOption(policy) ? payable : JValue.CreateNull();
+                string blocked = DiplomacyBlocker(policy, nation, faction, cost, possible);
+                row["blockedBy"] = blocked != null
+                    ? (JToken)new JValue(blocked) : JValue.CreateNull();
+                rows.Add(row);
+            }
+            o["options"] = rows;
+            return o;
+        }
+
+        // The first gate an enact call would hit, given a target out of this option's
+        // own list. Null means only `confirm` stands between the caller and enactment.
+        // Same order and same tests as DiplomacyEnact, so a row with no blocker and an
+        // enact call that refuses would be a bug rather than a difference of opinion.
+        static string DiplomacyBlocker(TIPolicyOption policy, TINationState nation,
+            TIFactionState faction, TIResourcesCost cost, IList<TIGameState> possible)
+        {
+            bool relation = IsRelationOption(policy);
+            if (relation && faction == null)
+                return "the nation has no executive faction";
+            if (possible == null || possible.Count == 0)
+                return "the option offers no eligible target here";
+            JToken allowed = Safe<JToken>(
+                delegate { return (JToken)policy.Allowed(nation); }, null);
+            if (allowed == null) return "the option's Allowed() threw";
+            if (!(bool)allowed)
+                return "the option has targets but Allowed() is false: "
+                    + AllowedConditions(policy, nation, possible);
+            if (relation && cost == null)
+                return "TINationState.FactionLevelRelationShipChangeCost did not resolve";
+            if (relation && !Safe<bool>(delegate { return cost.CanAfford(faction); }, false))
+                return StateName(faction) + " cannot pay " + CostText(cost);
+            return null;
+        }
+
+        // What an Allowed() that is false while the target list is not empty could be
+        // reading. Only one vanilla option has such a clause, and naming the stockpile
+        // is the difference between a usable refusal and a tautology.
+        static string AllowedConditions(TIPolicyOption policy, TINationState nation,
+            IList<TIGameState> possible)
+        {
+            var parts = new List<string>();
+            parts.Add("possibleTargets=" + (possible != null ? possible.Count : -1));
+            if (policy is EmployNuclearWeaponsOption)
+                parts.Add("numNuclearWeapons=" + Safe<int>(
+                    delegate { return nation.numNuclearWeapons; }, -1)
+                    + " (Allowed requires more than 0; NuclearWeaponsTargets carries no "
+                    + "stockpile term of its own, so a nation at war with an empty "
+                    + "stockpile still lists targets)");
+            return string.Join(" ", parts.ToArray());
+        }
+
+        #endregion
+
+        #region enact mode
+
+        static JToken DiplomacyEnact(JObject args, TINationState nation, TIPolicyOption policy)
+        {
+            bool relation = IsRelationOption(policy);
+            // Everything at faction level that is not one of the four relation changes
+            // needs an explicit confirm. Keyed on the negative so a sixth option added
+            // by a game update lands on the cautious side rather than the silent one;
+            // the audit string names the drift either way.
+            bool requiresConfirm = !relation;
+
+            // Gate 2: the executive faction. Every path the engine takes to the four
+            // relation options charges that faction and hands it on:
+            // HandleFactionLevelRelationshipChanges returns without acting when it is
+            // null, HandlePromptArmyOrderedToDepartDecision pays from it before starting
+            // a ProposeAllianceOption confirm, and each OnPassage body hands it to
+            // InitiateAlliance / EndAlliance / InitiateRivalry / EndRivalry. The nuclear
+            // option is not gated on it: when executiveFaction is null the AI planner
+            // calls OnConfirm directly, so refusing there would be stricter than the
+            // engine.
+            TIFactionState faction = ExecutiveFaction(nation);
+            if (relation && faction == null)
+                throw new VerbError(PolicyName(policy) + " needs an executive faction in "
+                    + StateName(nation) + " (" + (int)nation.ID + "), which holds none ("
+                    + ControlPointCount(nation) + " control points): every path the "
+                    + "engine takes to the four relationship options charges that "
+                    + "faction and hands it to the relationship call, and "
+                    + "HandleFactionLevelRelationshipChanges returns without acting at "
+                    + "all when it is null");
+
+            // Gate 4: the option's own eligible list, which is the Can* check.
+            IList<TIGameState> possible = PossibleTargets(policy, nation);
+            TIGameState target = DiplomacyTarget(args, policy, nation, possible);
+
+            // Gate 5: the option's own Allowed(). For the four relation options this is
+            // the target count and the gate above already covers it, but
+            // EmployNuclearWeaponsOption.Allowed carries an independent numNuclearWeapons
+            // > 0 clause that NuclearWeaponsTargets does not: a nation at war with no
+            // warheads left still offers targets, and firing anyway would decrement a
+            // stockpile ChangeNumNuclearWeapons clamps at zero while the strike still
+            // lands as permanent campaign state. Checked generically so any future
+            // option whose Allowed carries clauses beyond target count is covered too.
+            JToken allowed = Safe<JToken>(
+                delegate { return (JToken)policy.Allowed(nation); }, null);
+            if (allowed == null)
+                throw new VerbError(PolicyName(policy) + ".Allowed(" + StateName(nation)
+                    + ") threw, so this call cannot establish that the option is legal");
+            if (!(bool)allowed)
+                throw new VerbError(PolicyName(policy) + ".Allowed() is false for "
+                    + StateName(nation) + " (" + (int)nation.ID + ") even though "
+                    + StateName(target) + " is in its target list, so the option carries "
+                    + "a condition beyond having a target: " + AllowedConditions(policy,
+                        nation, possible));
+
+            // Gate 6: the cost the UI pays before enacting, paid the same way here.
+            TIResourcesCost cost = relation ? RelationshipChangeCost() : null;
+            if (relation && cost == null)
+                throw new VerbError("TINationState.FactionLevelRelationShipChangeCost did "
+                    + "not resolve, so the cost the engine charges for a relationship "
+                    + "change cannot be paid; refusing rather than enacting for free");
+            if (relation && !Safe<bool>(delegate { return cost.CanAfford(faction); }, false))
+                throw new VerbError(StateName(faction) + " (" + (int)faction.ID
+                    + ") cannot pay " + CostText(cost) + ", which "
+                    + "HandleFactionLevelRelationshipChanges charges before enacting any "
+                    + "of the four relationship options; it holds "
+                    + HoldingsText(cost, faction));
+
+            // Gate 7: explicit confirmation, for the option that cannot be undone.
+            bool confirm = Bool(args, "confirm", false);
+            if (requiresConfirm && !confirm)
+                throw new VerbError(IrreversibleRefusal(policy, nation, target));
+
+            var o = new JObject();
+            o["nation"] = Describe(nation);
+            o["executiveFaction"] = faction != null ? Describe(faction) : JValue.CreateNull();
+            o["option"] = DescribeDiplomacyOption(policy);
+            o["target"] = DiplomacyTargetToken(target);
+            o["confirm"] = confirm;
+            o["cost"] = cost != null ? CostToken(cost) : JValue.CreateNull();
+            string audit = DiplomacyAudit();
+            o["optionsAudit"] = audit != null ? (JToken)new JValue(audit) : JValue.CreateNull();
+
+            // Snapshots taken before anything moves; every read-back below is against
+            // one of these.
+            TINationState targetNation = target as TINationState;
+            bool wasAlly = RelationHolds(nation, targetNation, true);
+            bool wasRival = RelationHolds(nation, targetNation, false);
+            int nukesBefore = Safe<int>(delegate { return nation.numNuclearWeapons; }, -1);
+            var targetRegion = target as TIRegionState;
+            int detonationsBefore = targetRegion != null
+                ? Safe<int>(delegate { return targetRegion.nuclearDetonations; }, -1) : -1;
+            JObject holdingsBefore = ResourceSnapshot(cost, faction);
+            string promptName = PromptNameOf(policy);
+            string probe = PromptProbe();
+            // A response prompt of this type from this same nation against this same
+            // target can already be outstanding from an earlier proposal, and the queue
+            // carries no call identity. Snapshotting it here is what makes
+            // awaitingResponse attributable to this call rather than merely true.
+            bool promptBefore = promptName != null && probe == null
+                && HasPolicyPromptFor(promptName, nation, target);
+            object newsBefore = NewestNotification();
+
+            bool paid = false;
+            if (relation)
+            {
+                // Same call, same label, same order as the engine's own entry point:
+                // the cost is charged before OnConfirm, not after, and PayCost makes no
+                // affordability check of its own -- the gate above is it. The two
+                // options that queue a response prompt are charged here too, because
+                // HandleFactionLevelRelationshipChanges pays before it dispatches and
+                // does not care whether the other side ever answers.
+                try { cost.PayCost(faction, RelationshipCostLabel); }
+                catch (Exception e)
+                {
+                    throw new VerbError("PayCost threw before " + PolicyName(policy)
+                        + " was enacted: " + Note(e));
+                }
+                paid = true;
+            }
+            o["costPaid"] = paid;
+
+            try { policy.OnConfirm(nation, target); }
+            catch (Exception e)
+            {
+                throw new VerbError(PolicyName(policy) + ".OnConfirm threw"
+                    + (paid ? " after the cost was charged" : "") + ": " + Note(e));
+            }
+            o["enactedVia"] = "TIPolicyOption.OnConfirm";
+
+            var back = new JObject();
+            JObject news = NewPolicyNotification(newsBefore);
+            back["notification"] = news != null ? (JToken)news : JValue.CreateNull();
+            back["enactedNow"] = news != null;
+            back["promptName"] = promptName != null
+                ? (JToken)new JValue(promptName) : JValue.CreateNull();
+            back["promptProbe"] = probe != null
+                ? (JToken)new JValue(probe) : JValue.CreateNull();
+            bool unknownPrompt = promptName == null || probe != null;
+            bool waiting = !unknownPrompt && HasPolicyPromptFor(promptName, nation, target);
+            back["awaitingResponse"] = promptName == null
+                ? (JToken)new JValue(false)
+                : (probe != null ? JValue.CreateNull() : (JToken)new JValue(waiting));
+            back["promptAlreadyQueued"] = unknownPrompt
+                ? JValue.CreateNull() : (JToken)new JValue(promptBefore);
+            back["promptQueuedByThisCall"] = unknownPrompt
+                ? JValue.CreateNull() : (JToken)new JValue(waiting && !promptBefore);
+
+            back["relation"] = relation
+                ? (JToken)RelationReadback(nation, targetNation, wasAlly, wasRival)
+                : JValue.CreateNull();
+            back["nuclear"] = relation
+                ? JValue.CreateNull()
+                : (JToken)NuclearReadback(nation, targetRegion, nukesBefore,
+                    detonationsBefore);
+            back["cost"] = paid
+                ? (JToken)CostReadback(cost, faction, holdingsBefore)
+                : JValue.CreateNull();
+            back["stillAllowed"] = Safe<JToken>(
+                delegate { return (JToken)policy.Allowed(nation); }, JValue.CreateNull());
+            back["targetStillPossible"] = StillPossible(policy, nation, target);
+            o["readback"] = back;
+            return o;
+        }
+
+        #endregion
+
+        #region read-back
+
+        // Policy.cs pairs a response prompt with the proposing nation alone, which is
+        // all nation.set_policy can do: its options raise prompts at three different
+        // acting states (the target, the target's nation, the enemy war leader) and it
+        // does not repeat that per-option logic. Both async options here take the base
+        // PromptPolicyResponse, which passes `policyTarget as TIPolityState` as
+        // actingState, so the pair (name, promptingGameState, actingState) identifies
+        // one proposal. Without the actingState term, the USA proposing to Canada and
+        // then to Mexico reads the Mexico call as already-queued.
+        static bool HasPolicyPromptFor(string promptName, TINationState nation,
+            TIGameState target)
+        {
+            if (string.IsNullOrEmpty(promptName) || nation == null || target == null)
+                return false;
+            TIPromptQueueState queue = Safe<TIPromptQueueState>(
+                delegate { return GameStateManager.PromptQueue(); }, null);
+            if (queue == null) return false;
+            return PromptRaisedFor(promptFactionListField, queue, promptName, nation, target)
+                || PromptRaisedFor(promptNationListField, queue, promptName, nation, target);
+        }
+
+        static bool PromptRaisedFor(System.Reflection.FieldInfo field,
+            TIPromptQueueState queue, string promptName, TINationState nation,
+            TIGameState target)
+        {
+            if (field == null) return false;
+            List<Prompt> list = Safe<List<Prompt>>(
+                delegate { return field.GetValue(queue) as List<Prompt>; }, null);
+            if (list == null) return false;
+            for (int i = 0; i < list.Count; i++)
+            {
+                Prompt prompt = list[i];
+                if (!string.Equals(Safe<string>(delegate { return prompt.name; }, null),
+                        promptName, StringComparison.Ordinal)) continue;
+                TIGameState raiser = Safe<TIGameState>(
+                    delegate { return prompt.promptingGameState; }, null);
+                if (!ReferenceEquals(raiser, nation)) continue;
+                TIGameState acting = Safe<TIGameState>(
+                    delegate { return prompt.actingState; }, null);
+                if (ReferenceEquals(acting, target)) return true;
+            }
+            return false;
+        }
+
+        // Allies and rivals as they stand now against the snapshot. The engine's own
+        // record (LogPolicyAdopted) says a policy passed, not that it took effect:
+        // InitiateRivalryOption.OnPassage re-checks CanRival and silently does nothing
+        // when it has gone false, while EnactPolicy logs either way.
+        static JObject RelationReadback(TINationState nation, TINationState target,
+            bool wasAlly, bool wasRival)
+        {
+            bool isAlly = RelationHolds(nation, target, true);
+            bool isRival = RelationHolds(nation, target, false);
+            var o = new JObject();
+            o["targetWasAlly"] = wasAlly;
+            o["targetIsAlly"] = isAlly;
+            o["targetWasRival"] = wasRival;
+            o["targetIsRival"] = isRival;
+            o["changed"] = isAlly != wasAlly || isRival != wasRival;
+            return o;
+        }
+
+        static bool RelationHolds(TINationState nation, TINationState target, bool ally)
+        {
+            if (nation == null || target == null) return false;
+            return Safe<bool>(delegate
+            {
+                List<TINationState> list = ally ? nation.allies : nation.rivals;
+                return list != null && list.Contains(target);
+            }, false);
+        }
+
+        // The launch, as far as this frame can see it: the warhead is off the books and
+        // the region's detonation count is up, but the damage rides a queued time event.
+        static JObject NuclearReadback(TINationState nation, TIRegionState region,
+            int nukesBefore, int detonationsBefore)
+        {
+            var o = new JObject();
+            o["stockpileBefore"] = nukesBefore;
+            Put(o, "stockpileAfter", delegate { return (JToken)nation.numNuclearWeapons; });
+            o["regionDetonationsBefore"] = detonationsBefore;
+            o["regionDetonationsAfter"] = region != null
+                ? Safe<JToken>(delegate { return (JToken)region.nuclearDetonations; },
+                    JValue.CreateNull())
+                : JValue.CreateNull();
+            o["damageDelaySeconds"] = NuclearArrivalDelaySeconds;
+            TIDateTime arrival = Safe<TIDateTime>(delegate
+            {
+                TIDateTime now = TITimeState.Now();
+                if (now == null) return null;
+                now.AddSeconds(NuclearArrivalDelaySeconds);
+                return now;
+            }, null);
+            o["damageArrivesAbout"] = arrival != null
+                ? (JToken)new JValue(InvariantDate(arrival)) : JValue.CreateNull();
+            o["note"] = "the strike is away: TIRegionState.NuclearAttackOnRegion fired the "
+                + "NuclearLaunch event, recorded the exchange in "
+                + "TIGlobalValuesState.currentNuclearExchanges, tallied the war and "
+                + "queued the damage as a time event at the date above. Nothing recalls "
+                + "that event. Advance the clock past it and read the region back with "
+                + "query.state for the casualties, unrest and environmental effects";
+            return o;
+        }
+
+        static JObject CostReadback(TIResourcesCost cost, TIFactionState faction,
+            JObject before)
+        {
+            var o = new JObject();
+            o["before"] = before;
+            JObject after = ResourceSnapshot(cost, faction);
+            o["after"] = after;
+            var spent = new JObject();
+            foreach (KeyValuePair<string, JToken> kv in before)
+            {
+                // Num answers a string for NaN and the infinities and Put answers null
+                // for a read that threw, so only two real numbers get subtracted; the
+                // rest report null rather than a difference invented from a cast.
+                JToken now = after[kv.Key];
+                spent[kv.Key] = IsNumber(kv.Value) && IsNumber(now)
+                    ? Num((float)kv.Value - (float)now)
+                    : JValue.CreateNull();
+            }
+            o["spent"] = spent;
+            o["label"] = RelationshipCostLabel;
+            return o;
+        }
+
+        #endregion
+
+        #region cost
+
+        static bool IsNumber(JToken t)
+        {
+            return t != null
+                && (t.Type == JTokenType.Integer || t.Type == JTokenType.Float);
+        }
+
+        static TIResourcesCost RelationshipChangeCost()
+        {
+            return Safe<TIResourcesCost>(
+                delegate { return TINationState.FactionLevelRelationShipChangeCost; }, null);
+        }
+
+        static JToken CostPayable(TIResourcesCost cost, TIFactionState faction)
+        {
+            if (cost == null || faction == null) return JValue.CreateNull();
+            return Safe<JToken>(
+                delegate { return (JToken)cost.CanAfford(faction); }, JValue.CreateNull());
+        }
+
+        // The faction's current holding of each resource the cost touches. Empty for a
+        // faction that could not be read, which is also what a null cost gives.
+        static JObject ResourceSnapshot(TIResourcesCost cost, TIFactionState faction)
+        {
+            var o = new JObject();
+            if (cost == null || faction == null) return o;
+            List<ResourceValue> values = Safe<List<ResourceValue>>(
+                delegate { return cost.resourceCosts; }, null);
+            for (int i = 0; values != null && i < values.Count; i++)
+            {
+                ResourceValue value = values[i];
+                Put(o, value.resource.ToString(), delegate
+                {
+                    return Num(faction.GetCurrentResourceAmount(value.resource));
+                });
+            }
+            return o;
+        }
+
+        static string CostText(TIResourcesCost cost)
+        {
+            if (cost == null) return "an unreadable cost";
+            List<ResourceValue> values = Safe<List<ResourceValue>>(
+                delegate { return cost.resourceCosts; }, null);
+            if (values == null || values.Count == 0) return "a cost with no resources";
+            var parts = new List<string>();
+            for (int i = 0; i < values.Count; i++)
+                parts.Add(values[i].value.ToString("0.##", CultureInfo.InvariantCulture)
+                    + " " + values[i].resource);
+            return string.Join(" + ", parts.ToArray());
+        }
+
+        static string HoldingsText(TIResourcesCost cost, TIFactionState faction)
+        {
+            JObject snapshot = ResourceSnapshot(cost, faction);
+            var parts = new List<string>();
+            foreach (KeyValuePair<string, JToken> kv in snapshot)
+                parts.Add(kv.Key + "="
+                    + (kv.Value != null ? kv.Value.ToString() : "<unreadable>"));
+            if (parts.Count == 0) return "nothing this call could read";
+            return string.Join(" ", parts.ToArray());
+        }
+
+        #endregion
+
+        #region options
+
+        // Every option the registry holds whose HandledAtFactionLevel is true. Registry
+        // instances only, as everywhere else: TIPolicyOption's constructor registers the
+        // instance with TemplateManager, so a fresh one would be a second template entry
+        // matching nothing the engine holds. (The engine's own UI does construct fresh
+        // ones here; that is its business, not a pattern to copy.)
+        static List<TIPolicyOption> FactionLevelOptions()
+        {
+            var list = new List<TIPolicyOption>();
+            List<TIPolicyOption> all = AllPolicyOptions();
+            for (int i = 0; i < all.Count; i++)
+            {
+                TIPolicyOption policy = all[i];
+                if (Safe<bool>(delegate { return policy.HandledAtFactionLevel(); }, false))
+                    list.Add(policy);
+            }
+            return list;
+        }
+
+        // The four options HandleFactionLevelRelationshipChanges dispatches on, which is
+        // exactly the set it charges FactionLevelRelationShipChangeCost for: its switch
+        // key is the option's own relationChange, and the base property answers None.
+        // Charging is keyed on the same value rather than on a list of type names, so
+        // the cost rule cannot drift away from the dispatcher it mirrors.
+        static bool IsRelationOption(TIPolicyOption policy)
+        {
+            return Safe<bool>(
+                delegate { return policy.relationChange != RelationChange.None; }, false);
+        }
+
+        static JObject DescribeDiplomacyOption(TIPolicyOption policy)
+        {
+            JObject o = DescribePolicy(policy);
+            Put(o, "relationChange",
+                delegate { return (JToken)policy.relationChange.ToString(); });
+            string prompt = PromptNameOf(policy);
+            o["async"] = prompt != null;
+            o["promptName"] = prompt != null
+                ? (JToken)new JValue(prompt) : JValue.CreateNull();
+            o["charged"] = IsRelationOption(policy);
+            o["requiresConfirm"] = !IsRelationOption(policy);
+            return o;
+        }
+
+        // Data name, PolicyType name or display name, resolved against the five only. A
+        // name that is a real option but not one of them is refused towards the verb
+        // that does enact it, which is the mistake worth naming precisely.
+        static TIPolicyOption ArgDiplomacyOption(string name)
+        {
+            List<TIPolicyOption> options = FactionLevelOptions();
+            if (options.Count == 0)
+                throw new VerbError("PolicyManager holds no faction-level policy options");
+            for (int i = 0; i < options.Count; i++)
+            {
+                if (string.Equals(PolicyName(options[i]), name,
+                        StringComparison.OrdinalIgnoreCase))
+                    return options[i];
+            }
+            for (int i = 0; i < options.Count; i++)
+            {
+                TIPolicyOption option = options[i];
+                if (Same(Safe<string>(delegate { return option.GetDisplayName(); }, null), name))
+                    return option;
+            }
+
+            List<TIPolicyOption> all = AllPolicyOptions();
+            for (int i = 0; i < all.Count; i++)
+            {
+                TIPolicyOption option = all[i];
+                bool hit = string.Equals(PolicyName(option), name,
+                        StringComparison.OrdinalIgnoreCase)
+                    || Same(Safe<string>(delegate { return option.GetDisplayName(); }, null),
+                        name);
+                if (!hit) continue;
+                throw new VerbError(PolicyName(option) + " is not handled at faction "
+                    + "level, so it belongs to nation.set_policy rather than this verb; "
+                    + "this verb enacts only " + DiplomacyOptionList(options));
+            }
+            throw new VerbError("no policy option named '" + name + "'; this verb enacts "
+                + DiplomacyOptionList(options));
+        }
+
+        static string DiplomacyOptionList(List<TIPolicyOption> options)
+        {
+            var names = new List<string>();
+            for (int i = 0; i < options.Count; i++)
+            {
+                TIPolicyOption option = options[i];
+                string display = Safe<string>(
+                    delegate { return option.GetDisplayName(); }, null);
+                names.Add(PolicyName(option)
+                    + (string.IsNullOrEmpty(display) ? "" : " (" + display + ")"));
+            }
+            names.Sort(StringComparer.Ordinal);
+            return string.Join(", ", names.ToArray());
+        }
+
+        #endregion
+
+        #region audit
+
+        // The verb rests on three facts about the registry: the faction-level set has
+        // exactly five members, the four that carry a RelationChange are the ones the
+        // engine charges for, and the one that does not is the nuclear launch. Each is
+        // read out of the live registry rather than assumed, and any drift is named
+        // here, logged once, and carried in every response -- the same treatment
+        // Policy.cs gives a prompt-queue field that stops resolving. Nothing is refused
+        // on drift: a sixth option would still be enactable, and would require confirm.
+        static bool auditRun;
+        static string auditNote;
+
+        static string DiplomacyAudit()
+        {
+            if (auditRun) return auditNote;
+            // An empty registry is PolicyManager.Initialize not having run yet, not
+            // drift, and caching that verdict would report it for the rest of the
+            // session. Both verb modes need a campaign, so this should not be
+            // reachable; it is not worth being wrong about permanently if it is.
+            if (FactionLevelOptions().Count == 0)
+                return "PolicyManager holds no faction-level options yet; the registry "
+                    + "is filled by PolicyManager.Initialize";
+            auditRun = true;
+            auditNote = ComputeDiplomacyAudit();
+            if (auditNote != null && Main.Log != null)
+                Main.Log.Log("WARNING: faction.diplomacy option audit: " + auditNote);
+            return auditNote;
+        }
+
+        static string ComputeDiplomacyAudit()
+        {
+            List<TIPolicyOption> options = FactionLevelOptions();
+            var problems = new List<string>();
+            if (options.Count != 5)
+                problems.Add("HandledAtFactionLevel is true for " + options.Count
+                    + " options, not the 5 this verb and nation.set_policy are written "
+                    + "against (" + DiplomacyOptionList(options) + ")");
+
+            var seen = new Dictionary<string, string>(StringComparer.Ordinal);
+            var uncharged = new List<string>();
+            for (int i = 0; i < options.Count; i++)
+            {
+                TIPolicyOption policy = options[i];
+                string key = PolicyName(policy);
+                if (!IsRelationOption(policy)) { uncharged.Add(key); continue; }
+                string change = Safe<string>(
+                    delegate { return policy.relationChange.ToString(); }, "<threw>");
+                if (seen.ContainsKey(change))
+                    problems.Add(change + " is claimed by both " + seen[change] + " and "
+                        + key + ", so the cost dispatcher's switch is no longer 1:1");
+                else seen[change] = key;
+            }
+            string[] expected = { "NormalToAlly", "AllyToNormal", "RivalToNormal",
+                                  "NormalToRival" };
+            for (int i = 0; i < expected.Length; i++)
+            {
+                if (!seen.ContainsKey(expected[i]))
+                    problems.Add("no faction-level option carries RelationChange."
+                        + expected[i] + ", which "
+                        + "HandleFactionLevelRelationshipChanges still switches on");
+            }
+            if (uncharged.Count != 1
+                || !string.Equals(uncharged[0], typeof(EmployNuclearWeaponsOption).Name,
+                    StringComparison.Ordinal))
+            {
+                problems.Add("the uncharged faction-level options are ["
+                    + string.Join(", ", uncharged.ToArray()) + "], not the single "
+                    + typeof(EmployNuclearWeaponsOption).Name + " this verb documents; "
+                    + "every one of them requires confirm:true");
+            }
+            if (problems.Count == 0) return null;
+            return string.Join("; ", problems.ToArray());
+        }
+
+        #endregion
+
+        #region targets and refusals
+
+        static JToken DiplomacyTargetToken(TIGameState target)
+        {
+            if (target == null) return JValue.CreateNull();
+            var o = Describe(target) as JObject;
+            if (o == null) return JValue.CreateNull();
+            var region = target as TIRegionState;
+            if (region != null)
+                Put(o, "nation", delegate
+                {
+                    TINationState owner = region.nation;
+                    return owner != null ? Describe(owner) : JValue.CreateNull();
+                });
+            return o;
+        }
+
+        // A state id, or a name matched inside the option's own eligible list. A name
+        // that is a real nation but not an eligible one is resolved anyway, so the
+        // refusal can carry the engine's own clause-by-clause verdict on it.
+        static TIGameState DiplomacyTarget(JObject args, TIPolicyOption policy,
+            TINationState nation, IList<TIGameState> possible)
+        {
+            JToken t = args != null ? args["target"] : null;
+            if (t == null || t.Type == JTokenType.Null)
+                throw new VerbError(PolicyName(policy) + " requires a target; "
+                    + PolicyTargetList(possible));
+            string text = (t.Type == JTokenType.String ? (string)t : t.ToString()).Trim();
+            if (text.Length == 0) throw new VerbError("arg 'target' is empty");
+
+            TIGameState target;
+            int id;
+            if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out id))
+                target = ById<TIGameState>(id);
+            else
+            {
+                target = MatchState(possible, text);
+                if (target == null && IsRelationOption(policy))
+                    target = Safe<TIGameState>(
+                        delegate { return ArgNation(args, "target"); }, null);
+                if (target == null)
+                    throw new VerbError("no target named '" + text + "' for "
+                        + PolicyName(policy) + " in " + StateName(nation) + "; "
+                        + PolicyTargetList(possible));
+            }
+
+            if (possible == null || !possible.Contains(target))
+                throw new VerbError(StateName(target) + " (" + (int)target.ID
+                    + ") is not eligible for " + PolicyName(policy) + " in "
+                    + StateName(nation) + "; " + PolicyTargetList(possible)
+                    + EligibilityNote(policy, nation, target));
+            return target;
+        }
+
+        // The engine's own feedback string for the Can* check behind this option's
+        // list, clause by clause, with the TMP markup stripped. Only the four relation
+        // options have one; the nuclear list is a region filter with no such text.
+        static string EligibilityNote(TIPolicyOption policy, TINationState nation,
+            TIGameState target)
+        {
+            var other = target as TINationState;
+            if (other == null) return "";
+            string change = Safe<string>(
+                delegate { return policy.relationChange.ToString(); }, null);
+            string feedback = Safe<string>(delegate
+            {
+                if (string.Equals(change, "NormalToAlly", StringComparison.Ordinal))
+                    return nation.CanAllyFeedback(other);
+                if (string.Equals(change, "AllyToNormal", StringComparison.Ordinal))
+                    return nation.CanEndAllianceFeedback(other);
+                if (string.Equals(change, "RivalToNormal", StringComparison.Ordinal))
+                    return nation.CanEndRivalryFeedback(other);
+                if (string.Equals(change, "NormalToRival", StringComparison.Ordinal))
+                    return nation.CanRivalFeedback(other);
+                return null;
+            }, null);
+            if (string.IsNullOrEmpty(feedback)) return "";
+            string plain = Safe<string>(
+                delegate { return tagPattern.Replace(feedback, ""); }, feedback);
+            plain = plain.Replace("\r", " ").Replace("\n", " ").Trim();
+            while (plain.Contains("  ")) plain = plain.Replace("  ", " ");
+            if (plain.Length == 0) return "";
+            return "; the engine's own check reads: " + plain;
+        }
+
+        static string IrreversibleRefusal(TIPolicyOption policy, TINationState nation,
+            TIGameState target)
+        {
+            bool nuclear = policy is EmployNuclearWeaponsOption;
+            string head = PolicyName(policy) + " against " + StateName(target) + " ("
+                + (int)target.ID + ") from " + StateName(nation) + " needs "
+                + "confirm:true and did not get it. ";
+            if (!nuclear)
+                return head + "Every faction-level option that is not one of the four "
+                    + "relationship changes is treated as irreversible by this verb, "
+                    + "because nothing downstream re-checks it: ConfirmPolicyAction "
+                    + "calls OnConfirm with no Allowed() test and returns immediately "
+                    + "afterwards";
+            return head + "This is the launch itself, not an order that can be recalled. "
+                + "OnConfirm runs NuclearAttackOnRegion straight away: a warhead comes "
+                + "off the stockpile, the region's detonation count goes up, the war "
+                + "tallies the strike, and the damage is queued as a time event "
+                + NuclearArrivalDelaySeconds.ToString("0", CultureInfo.InvariantCulture)
+                + " seconds of game time ahead. Nothing in the engine cancels that "
+                + "event. The strike also stands permanently in the campaign's "
+                + "environmental record. Pass confirm:true to launch";
+        }
+
+        static int ControlPointCount(TINationState nation)
+        {
+            return Safe<int>(delegate
+            {
+                List<TIControlPoint> points = nation.controlPoints;
+                return points != null ? points.Count : 0;
+            }, 0);
+        }
+
+        #endregion
+    }
+}

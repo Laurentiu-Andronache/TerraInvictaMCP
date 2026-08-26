@@ -1,0 +1,6 @@
+# Shell scripts must stay LF on every platform: a CRLF install.sh fails under
+# WSL or Git Bash with "\r: command not found". Everything else follows the
+# checkout's own setting.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf

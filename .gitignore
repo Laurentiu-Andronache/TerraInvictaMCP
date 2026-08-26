@@ -1,0 +1,11 @@
+# Build output (install.sh), Mod Manager runtime state, and generated caches
+*.dll
+*.dll.*.cache
+Settings.xml
+__pycache__/
+server/modcheck_baseline.dat
+server/modcheck_enums.dat
+release/
+.env
+*.swp
+*~

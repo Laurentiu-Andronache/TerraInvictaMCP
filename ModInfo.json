@@ -1,0 +1,13 @@
+{
+	"Id": "TerraInvictaMCP",
+	"DisplayName": "Terra Invicta MCP [1.0.51+]",
+	"Title": "TerraInvictaMCP",
+	"Author": "MeatBunny",
+	"Version": "0.1.0",
+	"HomePage": "https://github.com/MeatBunny/TerraInvictaMCP",
+	"Requirements": [],
+	"ManagerVersion": "0.24.0.0",
+	"AssemblyName": "TerraInvictaMCP.dll",
+	"EntryMethod": "TerraInvictaMCP.Main.Load",
+	"Description": "Test Terra Invicta mods with an AI assistant: an MCP server that can start the game, run campaigns, resolve battles, and verify a mod's changes, references, text, and conflicts. See README.md."
+}
