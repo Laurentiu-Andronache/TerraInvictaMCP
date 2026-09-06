@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using Newtonsoft.Json.Linq;
 using PavonisInteractive.TerraInvicta;
 
@@ -137,11 +138,23 @@ namespace TerraInvictaMCP
                 site.FoundHab();
                 return site;
             }
+            // An orbit is taken as it is, with nothing claimed. TIOrbitState.FoundHab
+            // is a bare decrement of pendingHabs (IL_0002-IL_0009) and the release half
+            // of somebody else's reservation: FoundStationOperation.OnOperationConfirm
+            // takes one with MarkPendingHab (IL_0033) and that operation's
+            // ExecuteOperation gives it back with FoundHab (IL_0006) as its hab becomes
+            // real. A spawn takes no reservation, so calling FoundHab here would spend
+            // an AI's, and the fleet already on its way would decrement a second time.
+            // Leaving it alone orphans nothing: an orbit holds a list of stations
+            // rather than one slot, the spawned hab joins that list through AssumeOrbit,
+            // and NewStationAllowed reads stationsInOrbit.Count + pendingHabs
+            // (IL_000c-IL_0018), so the count stays honest on both halves. The hab-site
+            // branch above refuses a reserved site instead, because a site holds exactly
+            // one hab and the arriving fleet would overwrite whatever was founded there.
             if (Safe<bool>(delegate { return selected.isOrbitState; }, false))
             {
                 TIOrbitState orbit = selected.ref_orbit;
                 if (orbit == null) throw new VerbError("orbit state has no orbit");
-                ClaimOrbit(orbit);
                 return orbit;
             }
 
@@ -163,18 +176,7 @@ namespace TerraInvictaMCP
             TIOrbitState first = FirstOrbit(body);
             if (first == null)
                 throw new VerbError("no free site or orbit at " + StateName(body));
-            ClaimOrbit(first);
             return first;
-        }
-
-        // TIOrbitState.FoundHab consumes a pending-station marker, the one the AI sets
-        // when it commits to building there. A spawn never sets one, and the counter is
-        // added to the orbit's station count in its capacity check, so decrementing from
-        // zero would quietly buy that orbit an extra station slot for the rest of the
-        // campaign. TIHabSiteState.FoundHab is a plain bool clear and needs no guard.
-        static void ClaimOrbit(TIOrbitState orbit)
-        {
-            if (Safe<int>(delegate { return orbit.pendingHabs; }, 0) > 0) orbit.FoundHab();
         }
 
         // Stricter than the engine's own vacantHabSites, which only rejects a site whose
@@ -472,8 +474,17 @@ namespace TerraInvictaMCP
                     + (owner != null ? StateName(owner) : "no nation")
                     + ", not " + StateName(nation));
 
-            float strength = Float(args, "strength", 1f);
-            if (strength <= 0f) throw new VerbError("arg 'strength' must be > 0");
+            // Strength is a fraction of full: SetStrength
+            // (IL_0002-IL_0011), TakeDamage (IL_0031-IL_0047) and HealDamage
+            // (IL_0020-IL_0036) each put it through Mathf.Clamp(x, 0, 1). NewArmy
+            // is the one writer that stores its argument raw (IL_008a-IL_008c),
+            // so a larger value stands until the first thing that damages or
+            // heals the army snaps it down to 1 with no warning.
+            float strength = Bounded("strength", Float(args, "strength", 1f), 0f, 1f,
+                "army strength is a 0..1 fraction of full, which every engine"
+                + " writer but NewArmy clamps; NewArmy stores it as given, so a"
+                + " larger value survives only until the army takes damage or"
+                + " heals");
 
             var army = GameStateManager.CreateNewGameState<TIArmyState>();
             try
@@ -594,13 +605,30 @@ namespace TerraInvictaMCP
 
         #region spawn.alien_site
 
+        // Ten years, as the ceiling on a landing's countdown. This one is ours:
+        // the engine has no maximum, only the default duration a missing 'days'
+        // asks for, and anything past a decade is a request the caller meant to
+        // be a number of days and got wrong.
+        const float MaxLandingDays = 3650f;
+
+        // The xenoforming ceiling, read from the engine rather than copied.
+        // TIRegionXenoformingState's static constructor sets spawnArmyValue to
+        // 100, and DailyXenoformingGrowth spends the level back down from there
+        // (IL_00a6-IL_00cc), so no level in play climbs past it. Guarded, since a
+        // ceiling this verb cannot read is no reason to refuse a sane request.
+        static float MaxXenoformingLevel()
+        {
+            return Safe<float>(
+                delegate { return TIRegionXenoformingState.spawnArmyValue; }, 100f);
+        }
+
         // Each region carries one holder state per alien site kind, all five created at
         // campaign init and hung on the region. This verb activates the holder that is
         // already there; creating another one would leave the region pointing at the old
         // one and the new state orphaned in the manager.
         static JToken SpawnAlienSite(JObject args)
         {
-            TIRegionState region = Arg<TIRegionState>(args, "region");
+            TIRegionState region = ArgRegion(args);
             string kind = Str(args, "kind");
             if (string.IsNullOrEmpty(kind)) throw new VerbError("missing arg 'kind'");
 
@@ -637,7 +665,20 @@ namespace TerraInvictaMCP
                     throw new VerbError("region already has an alien landing");
                 // The engine's own default for "however long the template says" is a
                 // negative override, so an absent 'days' passes straight through.
-                holder.TriggerLanding(Float(args, "days", -1f));
+                //
+                // Ten years is the ceiling. TriggerLanding sets landingPresent and
+                // the site's HP (IL_0000-IL_000d) before it so much as reads the
+                // argument (IL_0062), so a duration AddDays refuses leaves a
+                // landing standing in the region that never deploys its army and
+                // that this verb then refuses to re-trigger. The engine's own
+                // duration is daysToFieldArmyFromUFO, 32 days.
+                holder.TriggerLanding(Bounded("days", Float(args, "days", -1f),
+                    float.NegativeInfinity, MaxLandingDays,
+                    "the landing is marked present and given HP before 'days' is"
+                    + " read, so a duration the engine's date arithmetic refuses"
+                    + " leaves a landing that never deploys; the engine's own"
+                    + " duration is daysToFieldArmyFromUFO (32), and 0 or less"
+                    + " asks for it"));
                 o["holder"] = Describe(holder);
                 Put(state, "landingPresent",
                     delegate { return (JToken)holder.landingPresent; });
@@ -646,11 +687,39 @@ namespace TerraInvictaMCP
             {
                 TIRegionXenoformingState holder = Holder<TIRegionXenoformingState>(
                     delegate { return region.xenoforming; }, "xenoforming");
-                float level = RequiredFloat(args, "level");
+                // Passed through unclamped below the ceiling. SetXenoformingLevel writes the value and
+                // then floors it with Mathf.Max(0, level) (IL_000e-IL_001f), so a
+                // negative reads back as 0 and level=0 is the engine's own removal
+                // rather than anything this verb invents. Both the level and Extant
+                // are read back afterwards, because the engine's floor is the only
+                // thing between the argument and the state.
+                //
+                // The ceiling is the engine's own spawnArmyValue, 100 in the
+                // static constructor. DailyXenoformingGrowth spends the level back
+                // down from there: at or above it, the region spawns a megafauna
+                // army and pays megafaunaSpawnCost, -50 (IL_00a6-IL_00cc), so no
+                // engine path holds a level much above 100. A larger one crashes
+                // the campaign: a faction taking intel on the region dates the
+                // reading with AddDays(-level * 12) from the campaign date in
+                // SetIntel (IL_04b5-IL_04d0), which throws past DateTime.MinValue
+                // on the next daily tick, with the level already written and the
+                // throw repeating on every tick after.
+                float ceiling = MaxXenoformingLevel();
+                float level = Bounded("level", RequiredFloat(args, "level"),
+                    float.NegativeInfinity, ceiling,
+                    "the engine's own ceiling is spawnArmyValue ("
+                    + FloatText(ceiling) + "), where xenoforming growth spends the"
+                    + " level back down by spawning megafauna; above it, SetIntel"
+                    + " dates a faction's reading with AddDays(-level * 12) and"
+                    + " throws past DateTime.MinValue on the next daily tick");
                 holder.SetXenoformingLevel(level);
                 o["holder"] = Describe(holder);
                 Put(state, "xenoformingLevel",
                     delegate { return Num(holder.xenoformingLevel); });
+                // The engine's own "is there xenoforming here": level > 0. It is
+                // what every caller wants after a removal, and deriving it from the
+                // level in the client would be guessing at the same comparison.
+                Put(state, "extant", delegate { return (JToken)holder.Extant(); });
             }
             else
             {
@@ -668,6 +737,59 @@ namespace TerraInvictaMCP
             T holder = Safe<T>(read, null);
             if (holder == null) throw new VerbError("region has no " + what + " state");
             return holder;
+        }
+
+        // Regions listed in a refusal before the list is cut.
+        const int MaxRegionsListed = 12;
+
+        // A region by state id or by name. The id is the addressable form and stays
+        // the primary one, but nothing hands a caller a region id: the interesting
+        // regions are named ones out of a nation, and finding the id first meant a
+        // query.state walk before every call. 'region_name' matches the region's
+        // templateName (its dataName) first and its display name second, so a
+        // dataName always wins over a localized string that happens to collide.
+        static TIRegionState ArgRegion(JObject args)
+        {
+            JToken id = args != null ? args["region"] : null;
+            if (id != null && id.Type != JTokenType.Null)
+                return Arg<TIRegionState>(args, "region");
+
+            string wanted = Str(args, "region_name");
+            if (wanted != null) wanted = wanted.Trim();
+            if (string.IsNullOrEmpty(wanted))
+                throw new VerbError("missing arg 'region': a TIRegionState id, or "
+                    + "'region_name' as the region's dataName or display name");
+
+            var byData = new List<TIRegionState>();
+            var byDisplay = new List<TIRegionState>();
+            foreach (TIRegionState r in
+                     GameStateManager.IterateByClass<TIRegionState>(false))
+            {
+                if (r == null) continue;
+                if (Same(r.templateName, wanted)) byData.Add(r);
+                else if (Same(StateName(r), wanted)) byDisplay.Add(r);
+            }
+            List<TIRegionState> found = byData.Count > 0 ? byData : byDisplay;
+            if (found.Count == 1) return found[0];
+            if (found.Count == 0)
+                throw new VerbError("no region whose dataName or display name is '"
+                    + wanted + "'");
+            // Two regions can share a display name across nations, and picking one
+            // would silently spawn the site in the wrong country.
+            throw new VerbError("'" + wanted + "' matches " + found.Count
+                + " regions; pass 'region' as a state id instead: "
+                + RegionIds(found));
+        }
+
+        static string RegionIds(List<TIRegionState> regions)
+        {
+            var rows = new List<string>();
+            int n = regions.Count < MaxRegionsListed ? regions.Count
+                                                    : MaxRegionsListed;
+            for (int i = 0; i < n; i++)
+                rows.Add((int)regions[i].ID + "=" + regions[i].templateName);
+            return string.Join(", ", rows.ToArray())
+                + (regions.Count > n ? ", ..." : "");
         }
 
         #endregion
@@ -697,12 +819,26 @@ namespace TerraInvictaMCP
 
         // A present but non-numeric value is an error rather than a silent fallback:
         // a mistyped strength that quietly became 1.0 would look like a passing test.
+        //
+        // NaN and the infinities are refused here, for every caller at once, because
+        // nothing downstream stops them. They pass a `<= 0` guard; SetXenoformingLevel
+        // floors its argument with Mathf.Max(0f, level) (IL_000e-IL_001f), which is
+        // `a > b ? a : b` and so answers NaN for NaN; TriggerLanding sets
+        // landingPresent and currentHP (IL_0000-IL_000d) before it looks at the
+        // argument at all and then tests it with bgt.un.s (IL_0068), an UNORDERED
+        // branch that sends NaN down the override path into AddDays; and NewArmy
+        // stores strength raw. Every one of them lands in campaign state that no
+        // later validation can take back out.
         static float Float(JObject args, string key, float fallback)
         {
             JToken t = args != null ? args[key] : null;
             if (t == null || t.Type == JTokenType.Null) return fallback;
-            try { return (float)t; }
+            float value;
+            try { value = (float)t; }
             catch (Exception) { throw new VerbError("arg '" + key + "' must be a number"); }
+            if (float.IsNaN(value) || float.IsInfinity(value))
+                throw new VerbError("arg '" + key + "' must be a finite number");
+            return value;
         }
 
         static float RequiredFloat(JObject args, string key)
@@ -711,6 +847,40 @@ namespace TerraInvictaMCP
             if (t == null || t.Type == JTokenType.Null)
                 throw new VerbError("missing arg '" + key + "'");
             return Float(args, key, 0f);
+        }
+
+        // Refuses a finite number the engine has no path back out of, before the
+        // engine call rather than after it. A fixture skips the play-legality
+        // around a mutator; where the engine's own callers could never produce a
+        // value, nothing downstream is written to survive one, and the damage
+        // lands in campaign state that no later validation removes.
+        //
+        // 'above' is exclusive and 'max' inclusive, which is the shape these
+        // arguments take: a fraction that has to be positive, or a magnitude with
+        // a ceiling and a meaningful sentinel below zero. Pass
+        // float.NegativeInfinity for 'above' where the engine floors the value
+        // itself, and the refusal then names only the bound that bites.
+        //
+        // Takes a value Float() has already returned, so NaN and the infinities
+        // are gone by here and these comparisons mean what they say: NaN answers
+        // false against both bounds and would otherwise walk straight through.
+        //
+        // 'why' is the engine fact that sets the bound. Without it a refusal
+        // reads as this verb being fussy about a number the engine would have
+        // taken.
+        static float Bounded(string key, float value, float above, float max, string why)
+        {
+            if (value > above && value <= max) return value;
+            string range = float.IsNegativeInfinity(above)
+                ? "at most " + FloatText(max)
+                : "greater than " + FloatText(above) + " and at most " + FloatText(max);
+            throw new VerbError("arg '" + key + "' must be " + range + ": " + why
+                + "; asked for " + FloatText(value));
+        }
+
+        static string FloatText(float value)
+        {
+            return value.ToString(CultureInfo.InvariantCulture);
         }
 
         #endregion

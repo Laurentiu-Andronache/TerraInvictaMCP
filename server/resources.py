@@ -70,11 +70,20 @@ def _saves_listing():
     saves = []
     try:
         for f in os.listdir(bridge.SAVES_DIR):
-            if not f.endswith(".gz"):
+            # Both formats the game writes, matching the bridge's own listing
+            # (SaveExtensions in src/Verbs.cs): a profile setting decides
+            # which one a campaign is saved in, and the fallback that reads
+            # only .gz reports an empty folder full of saves.
+            name, ext = os.path.splitext(f)
+            if ext not in (".gz", ".json"):
                 continue
             path = os.path.join(bridge.SAVES_DIR, f)
             saves.append({
-                "name": f[:-3],
+                "name": name,
+                # Carried because the name alone is ambiguous once both
+                # formats are listed, and because the bridge's own listing
+                # carries it.
+                "extension": ext,
                 "modified": datetime.datetime.fromtimestamp(
                     os.path.getmtime(path)).isoformat(timespec="seconds"),
                 "bytes": os.path.getsize(path)})

@@ -126,12 +126,25 @@ namespace TerraInvictaMCP
                             string line = encoding.GetString(pending, 0, len);
                             pendingLen = 0;
                             if (line.Trim().Length == 0) continue;
+                            // Parsing stays outside the lock, but the closed test and
+                            // the enqueue are one critical section. Split, they let a
+                            // reader still inside Parse when Stop() runs put work on a
+                            // queue Stop() has already emptied: that command executes
+                            // on the next enable, mutates the campaign, and its answer
+                            // goes to a closed connection, so nobody ever sees it.
+                            // Close() sets `closed` under this same lock, so after it
+                            // returns no line from this reader can reach the queue.
+                            Request req = Parse(line);
                             lock (gate)
                             {
                                 if (closed) return;
                                 outstanding++;
+                                // Safe to call under `gate`: Server.Enqueue only
+                                // touches the lock-free ConcurrentQueue. Close() runs
+                                // `gate` and then connGate, so anything here that took
+                                // connGate would invert that order.
+                                Server.Enqueue(this, req);
                             }
-                            Server.Enqueue(this, Parse(line));
                             continue;
                         }
                         if (pendingLen >= MaxLineBytes)
@@ -221,7 +234,10 @@ namespace TerraInvictaMCP
         static readonly ConcurrentQueue<WorkItem> queue = new ConcurrentQueue<WorkItem>();
         static readonly List<Connection> connections = new List<Connection>();
         static readonly object connGate = new object();
-        static TcpListener listener;
+        // Volatile because the accept threads test it for identity: an accept thread
+        // and the main thread that toggles the mod are different threads, and a cached
+        // read of the field would let a leftover thread believe it is still current.
+        static volatile TcpListener listener;
         static volatile bool stopped;
 
         public static string LastError = "";
@@ -249,7 +265,11 @@ namespace TerraInvictaMCP
             var accept = new Thread(AcceptLoop);
             accept.IsBackground = true;
             accept.Name = "TerraInvictaMCP accept";
-            accept.Start();
+            // The thread is handed its own listener rather than reading the static
+            // one at entry: a Stop that lands between here and the first instruction
+            // of the loop would otherwise give it whatever the field holds by then,
+            // which after a restart is somebody else's listener.
+            accept.Start(l);
             return true;
         }
 
@@ -262,21 +282,30 @@ namespace TerraInvictaMCP
             {
                 try { l.Stop(); } catch (Exception) { }
             }
-            // Work queued before the toggle must not execute on the next enable.
-            WorkItem drop;
-            while (queue.TryDequeue(out drop)) { }
+            // Connections close before the queue is cleared, not after. A reader
+            // enqueues under its connection's own lock and Close() sets `closed`
+            // under that lock, so once every connection is closed nothing can add
+            // work any more and the clear below is final. The other order leaves a
+            // reader parked in Parse free to enqueue after the clear, and work
+            // queued before the toggle must not execute on the next enable.
             Connection[] live;
             lock (connGate) live = connections.ToArray();
             for (int i = 0; i < live.Length; i++)
             {
                 try { live[i].Close(); } catch (Exception) { }
             }
+            WorkItem drop;
+            while (queue.TryDequeue(out drop)) { }
         }
 
-        static void AcceptLoop()
+        static void AcceptLoop(object started)
         {
-            TcpListener mine = listener;
-            while (true)
+            TcpListener mine = (TcpListener)started;
+            // Identity, not a flag. `stopped` is cleared again by the next Start, so a
+            // thread left over from an earlier listener would read it as false and go
+            // on feeding the current server. It runs only while its own listener is
+            // the one installed.
+            while (ReferenceEquals(mine, listener))
             {
                 TcpClient client;
                 try { client = mine.AcceptTcpClient(); }
@@ -291,11 +320,14 @@ namespace TerraInvictaMCP
                     var conn = new Connection(client);
                     bool late;
                     // Stop() flips the flag before it snapshots the list, so a connection
-                    // registered on either side of that snapshot still gets closed.
+                    // registered on either side of that snapshot still gets closed. The
+                    // identity test covers the rest of the toggle: Stop clears the field
+                    // and Start installs a new listener, either of which makes this
+                    // accept a leftover of a server that is gone.
                     lock (connGate)
                     {
                         connections.Add(conn);
-                        late = stopped;
+                        late = stopped || !ReferenceEquals(mine, listener);
                     }
                     if (late) conn.Close();
                     else conn.Start();

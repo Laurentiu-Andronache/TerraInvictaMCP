@@ -112,9 +112,11 @@ namespace TerraInvictaMCP
             if (stat == null)
                 throw new VerbError("unknown stat '" + wanted + "'; " + StatMenu());
 
+            // Float() refuses NaN and the infinities for every caller, so what
+            // arrives here is a finite number and the range test below means what
+            // it says: NaN compares false against both bounds and would otherwise
+            // walk straight through it.
             float value = RequiredFloat(args, "value");
-            if (float.IsNaN(value) || float.IsInfinity(value))
-                throw new VerbError("arg 'value' must be a finite number");
             if (value < stat.min || value > stat.max)
                 throw new VerbError(stat.name + " is clamped to "
                     + Range(stat) + " by the engine's own setter, and a request "
@@ -247,7 +249,7 @@ namespace TerraInvictaMCP
                 // discovery path.
                 if (habId >= 0)
                     throw new VerbError("arg 'module' is a module state id; "
-                        + ModuleList(ById<TIHabState>(habId)));
+                        + ModuleListFor(habId));
                 throw new VerbError("missing arg 'module' (a TIHabModuleState id); "
                     + "pass 'hab' alone to list a hab's modules and their ids");
             }
@@ -292,15 +294,171 @@ namespace TerraInvictaMCP
                 TIHabModuleTemplate t = module.moduleTemplate;
                 return t != null && t.coreModule;
             }, false);
+            bool wormhole = Safe<bool>(delegate
+            {
+                TIHabModuleTemplate t = module.moduleTemplate;
+                return t != null && t.SpecialRules != null
+                    && t.SpecialRules.Contains(HabModuleSpecialRule.AlienWormhole);
+            }, false);
+            bool overrideWanted = Flag(args, "override_protection");
+            // The engine's own refusal, read before the call so the reply can say
+            // whether the flag had anything to override. DestroyModule returns
+            // false at IL_005d when the HAB's faction is alien, the hab is that
+            // faction's primaryHab, and the module is a core module or carries
+            // HabModuleSpecialRule.AlienWormhole (IL_0014-IL_005e).
+            TIFactionState owner = Safe<TIFactionState>(
+                delegate { return hab.faction; }, null);
+            bool alienOwner = owner != null
+                && Safe<bool>(delegate { return owner.IsAlienFaction; }, false);
+            // The engine's own comparison, which is not reference equality:
+            // TIGameState overrides Equals to compare GameStateIDs, and == goes
+            // through it. ReferenceEquals would answer differently for two
+            // instances carrying one id.
+            bool isPrimary = alienOwner && Safe<bool>(
+                delegate { return owner.primaryHab == hab; }, false);
+            bool blocked = isPrimary && (core || wormhole);
+            // The count the engine's own last-module branch reads, taken from the
+            // same call it makes: DestroyModule tests `OkayModules().Count` after
+            // the destruction and runs DestroyHab on zero. OkayModules caches per
+            // frame, and reading it here would poison that branch's answer if the
+            // engine did not invalidate the cache -- it does, in
+            // TIHabModuleState.DestroyModule, which calls hab.SetModulesDirty()
+            // immediately after setting `destroyed`. So this reading and the
+            // engine's are the same notion of "okay", one destruction apart.
+            //
+            // Taken before anything below changes state, and every refusal that
+            // reads it is made before the DestroyModule call.
+            int okayBefore = ModuleCount(hab, true);
+            // Unreadable rather than zero. ModuleCount answers -1 when the read
+            // threw, and every refusal below is a test against 1; letting an
+            // unknown count fall through would run exactly the calls those
+            // refusals exist to stop.
+            if (okayBefore < 0)
+                throw new VerbError("hab " + (int)hab.ID + " would not report its "
+                    + "okay modules, so whether module " + (int)module.ID + " is "
+                    + "its last one is unknown -- and that is the case that takes "
+                    + "the hab down. Refused rather than guessed. Nothing was "
+                    + "changed; read the hab with query.state");
+
+            // Whether the engine will actually destroy anything on this call.
+            // Under the engine's own refusal it returns false at IL_005d having
+            // touched nothing, so neither the hab-destruction branch nor the
+            // reporting path below it is reached.
+            bool willDestroy = !blocked || overrideWanted;
+
+            // Refused rather than overridden: the flag exists to reach the
+            // module-loss branches the engine's refusal hides, and destroying the
+            // hab's last okay module reaches something else entirely. DestroyHab
+            // carries an alien-primary-hab guard of its own, an identity test
+            // against the same primaryHab field, and with that field pointed
+            // elsewhere it would read false and let the whole tail run: the
+            // notification queue cleaned of the archived state, the kill
+            // registered, resolving missions rewritten, the faction's fleets
+            // re-homed and the hab archived. The engine stops after logging the
+            // loss for that one hab. The finally below would then restore
+            // primaryHab to a hab that is gone.
+            // `<= 1`, not `== 1`. TIHabState.OkayModules walks activeSectors
+            // only, while this verb's precondition is the module's own `okay`
+            // flag, which carries no sector test. A module that is okay inside an
+            // inactive sector is therefore not in the count, so the hab can read
+            // zero okay modules with a destroyable one in hand -- and after the
+            // destruction the count is still zero, which is exactly the branch
+            // that runs DestroyHab. Both readings reach the hab-destruction path
+            // and both have to be refused here.
+            if (blocked && overrideWanted && okayBefore <= 1)
+                throw new VerbError("override_protection is refused here: the hab "
+                    + "reports " + okayBefore + " okay module(s), so destroying "
+                    + "module " + (int)module.ID + " leaves it with none and "
+                    + "would take the alien faction's primary hab "
+                    + "down with it. DestroyHab has an alien-primary-hab guard of "
+                    + "its own, and the primaryHab swap this flag makes would "
+                    + "bypass that one as well as the one inside DestroyModule: "
+                    + "instead of stopping once it has logged the loss, the engine "
+                    + "would clean the notification queue, register the kill, "
+                    + "resolve missions, re-home the faction's fleets and archive "
+                    + "the hab, and the restore afterwards would leave primaryHab "
+                    + "pointing at an archived hab. Taking the hab down is not "
+                    + "what the flag is for. To test module loss, destroy a "
+                    + "different module; this hab has no other okay one, so give "
+                    + "it one with spawn.module first. Nothing was changed");
+
+            // The engine cannot take a hab down for nobody. DestroyModule's
+            // last-module branch calls DestroyHab, and both of DestroyHab's
+            // reporting paths -- the alien-primary-hab one that logs the loss and
+            // returns (IL_038e-IL_03ae) and the ordinary one that archives the hab
+            // (IL_09d3-IL_09eb) -- hand the destroying faction to
+            // TINotificationQueueState.LogHabDestroyed, whose first use of it is
+            // `destroyingFaction.displayNameCapitalized` on a callvirt with no null
+            // test (IL_008c on the alien headline, IL_0153 on the ordinary one).
+            // With no destroyer that is a NullReferenceException thrown AFTER the
+            // module has already been destroyed, which is a half-applied call the
+            // engine's own callers never make: every one of them is a combat, a
+            // bombardment or a mission, and each names a faction.
+            //
+            // Observed: a call with no destroyer on the last okay module of the
+            // alien primary hab left the module destroyed, the hab alive and
+            // unarchived, and returned a bare NRE with no reply body.
+            // `<= 1` for the reason given on the refusal above: OkayModules
+            // counts active sectors only, so an okay module in an inactive
+            // sector leaves the count at zero, and zero reaches the same
+            // DestroyHab branch that one does. `== 1` let that reading through
+            // to the engine with a null destroyer, which is the NRE below.
+            if (willDestroy && okayBefore <= 1 && destroyer == null)
+                throw new VerbError("hab " + (int)hab.ID + " reports " + okayBefore
+                    + " okay module(s), so destroying module " + (int)module.ID
+                    + " leaves it with none and runs the "
+                    + "engine's hab destruction, and that path reports the loss "
+                    + "through the destroying faction with no null check: with no "
+                    + "'destroyer' it throws a NullReferenceException after the "
+                    + "module is already gone. Pass 'destroyer' (a faction id) to "
+                    + "make this call, destroy a different module, or take the "
+                    + "hab out with kill.state. On the alien faction's primary "
+                    + "hab even a named destroyer leaves the hab standing: the "
+                    + "engine logs the loss and returns without archiving it. "
+                    + "Nothing was changed");
 
             var o = new JObject();
             o["hab"] = Describe(hab);
             o["module"] = DescribeModule(module);
             o["coreModule"] = core;
+            o["alienWormhole"] = wormhole;
+            o["engineWouldRefuse"] = blocked;
+            o["overrideProtection"] = overrideWanted;
             o["destroyer"] = destroyer != null ? Describe(destroyer) : (JToken)JValue.CreateNull();
-            o["hate"] = HateToken(module, hateOn, hate);
-            int okayBefore = ModuleCount(hab, true);
             o["okayModulesBefore"] = okayBefore;
+
+            // The override, and only when the refusal would actually fire. The
+            // engine's test is an identity comparison against the alien faction's
+            // primaryHab, a public field, so pointing that field at some other hab
+            // of the same faction for the duration of the one call is the whole
+            // trick. It is restored in a finally rather than left to the engine:
+            // ResetPrimaryHab returns at its first instruction unless the faction
+            // is the active HUMAN one, so nothing else puts the field back. The
+            // hab cannot go down under the swap, because the last-okay-module case
+            // is refused above, so the restore always names the same live hab the
+            // field named before the call.
+            bool overrideApplied = blocked && overrideWanted;
+            TIHabState savedPrimary = overrideApplied ? owner.primaryHab : null;
+            if (overrideApplied) owner.primaryHab = OtherHab(owner, hab);
+
+            // Read BEFORE the destruction, because the destruction changes it.
+            // TIHabModuleState.tier is moduleTemplate.tier, and that type's own
+            // DestroyModule replaces the template outright: it builds a wreckage
+            // name from "DestroyedModule" or "AlienDestroyedModule" plus the old
+            // tier plus a random 1-2 suffix (IL_00d4-IL_010b of that method) and
+            // hands it to SetModuleTemplate (IL_010e). Afterwards `module.tier`
+            // is the WRECKAGE template's tier. Vanilla wreckage entries happen to
+            // carry the tier they are named for, so reading it after the call
+            // agreed with the engine by data coincidence; a mod that ships a
+            // wreckage entry with a different tier breaks that silently.
+            //
+            // The engine computes its hate from the original: TIHabState's
+            // DestroyModule reads get_tier at IL_00c7, applies the hate at
+            // IL_00df, and calls the module's own DestroyModule() only at
+            // IL_0130. Null when the read throws, which keeps `applied` null
+            // rather than making up a number.
+            JToken tier = Safe<JToken>(delegate { return (JToken)module.tier; },
+                JValue.CreateNull());
 
             // The engine's own destruction, the same call TIEffectsState's
             // DestroyRandomModules makes with every optional argument left at its
@@ -310,10 +468,49 @@ namespace TerraInvictaMCP
             // and refunds the build cost, which models a teardown, while this
             // leaves wreckage in the slot, fires HabModuleDestroyed, and takes the
             // hab down when the last okay module goes.
-            bool destroyed = hab.DestroyModule(destroyer, module, false, false,
-                true, hate, false, false);
+            //
+            // A throw out of it is caught rather than let out. By the time the
+            // engine throws, the module is destroyed and the hab may or may not
+            // be: an error envelope carries a message and no data, so the one
+            // reading that says what the call left behind would be the one thing
+            // the caller could not get. The reply below is built either way, with
+            // `engineThrew` naming the exception and the read-backs saying where
+            // the state landed. The refusals above cover the throw this has
+            // actually been seen to take; anything else is a new one and the
+            // caller needs its text, not a bare NullReferenceException.
+            bool destroyed;
+            JToken threw = JValue.CreateNull();
+            try
+            {
+                destroyed = hab.DestroyModule(destroyer, module, false, false,
+                    true, hate, false, false);
+            }
+            catch (Exception e)
+            {
+                threw = new JValue(Note(e));
+                // Read back rather than assumed either way: the engine sets
+                // `destroyed` on the module before anything that can throw.
+                destroyed = !Safe<bool>(delegate { return module.okay; }, true);
+            }
+            finally
+            {
+                if (overrideApplied) owner.primaryHab = savedPrimary;
+            }
 
+            o["engineThrew"] = threw;
+            o["overrideApplied"] = overrideApplied;
+            if (owner != null)
+                Put(o, "primaryHab", delegate
+                {
+                    TIHabState primary = owner.primaryHab;
+                    return primary != null ? Describe(primary)
+                                           : (JToken)JValue.CreateNull();
+                });
             o["destroyed"] = destroyed;
+            // Built here, after the call, because `applied` is a claim about what the
+            // engine did and only the return value says that. The tier it works from
+            // was read before the call, for the reason given there.
+            o["hate"] = HateToken(tier, hateOn, hate, destroyed);
             o["moduleAfter"] = Safe<JToken>(
                 delegate { return DescribeModule(module); }, JValue.CreateNull());
             bool habGone = Safe<bool>(delegate { return hab.archived; }, false);
@@ -322,11 +519,35 @@ namespace TerraInvictaMCP
             o["presentModulesAfter"] = habGone ? -1 : ModuleCount(hab, false);
 
             var warnings = new List<string>();
-            if (!destroyed)
+            // First, because everything after it describes a call that ran to the
+            // end and this one did not.
+            if (threw.Type != JTokenType.Null)
+                warnings.Add("DestroyModule THREW: " + threw.ToString()
+                    + ". Whatever it had already done stands -- `destroyed`, "
+                    + "`habDestroyed`, `primaryHab` and the module counts above are "
+                    + "read back from the game after the throw, so they say where "
+                    + "the state landed. This is an engine path the verb's refusals "
+                    + "did not know about; report it");
+            // Only when the call ran to the end: after a throw, a false here is
+            // "the engine never got to say", not the documented refusal.
+            if (!destroyed && threw.Type == JTokenType.Null)
                 warnings.Add("the engine refused the destruction and reported "
                     + "false; the one case that does this is a core module, or one "
                     + "whose template carries HabModuleSpecialRule.AlienWormhole, "
-                    + "on the alien faction's primary hab");
+                    + "on the alien faction's primary hab"
+                    + (blocked && !overrideWanted
+                        ? ", which is exactly this call. Pass "
+                          + "override_protection=true to destroy it anyway"
+                        : ""));
+            if (overrideApplied && destroyed)
+                warnings.Add("override_protection was set, so the alien faction's "
+                    + "primaryHab was pointed elsewhere for the one DestroyModule "
+                    + "call and restored afterwards. The engine protects this "
+                    + "module because NO PLAY PATH destroys it: nothing in "
+                    + "bombardment, combat or a mission picks a core module or an "
+                    + "AlienWormhole on the alien primary hab, so the resulting "
+                    + "campaign state is one the game never produces and anything "
+                    + "downstream of it proves nothing about play");
             if (core && destroyed)
                 warnings.Add("a core module was destroyed; vanilla bombardment "
                     + "and combat never pick the core, so this is a hab state no "
@@ -334,37 +555,89 @@ namespace TerraInvictaMCP
             if (habGone)
                 warnings.Add("that was the hab's last okay module, so the engine "
                     + "destroyed the hab itself");
-            if (hateOn)
+            // Only when something was actually destroyed. The hate branch sits inside
+            // the destruction, after the refusal returns false at IL_005d, so a
+            // refused or thrown call applied none of it -- and this warning used to
+            // announce hate the campaign never gained.
+            if (hateOn && destroyed)
                 warnings.Add("hate was switched on, so the hab's owner gained "
                     + "hate toward the destroyer and both sides may have "
                     + "committed atrocities; see the hate object for the amount "
                     + "the engine computed");
+            if (hateOn && !destroyed)
+                warnings.Add("hate was requested, but nothing was destroyed, so the "
+                    + "engine never reached its hate branch: no hate was gained and "
+                    + "no atrocity was committed");
             if (warnings.Count > 0)
                 o["warning"] = string.Join("; ", warnings.ToArray());
             return o;
         }
 
-        // What the engine will actually apply, read the same way DestroyModule
-        // computes it: tier * factionHateMultiplierPerModuleDestroyedPerTier,
-        // with the requested number never entering the arithmetic. Read before
-        // the destruction, because the module's tier goes with its template.
-        static JObject HateToken(TIHabModuleState module, bool enabled, float requested)
+        // What the engine actually applied, computed the way DestroyModule computes
+        // it: tier * factionHateMultiplierPerModuleDestroyedPerTier, with the
+        // requested number never entering the arithmetic.
+        //
+        // `destroyed` is the engine's own return value, and `applied` is zero without
+        // it. The hate branch is inside the destruction (TIHabState.DestroyModule
+        // tests hate > 0 at IL_00b6-IL_00bd and calls GainFactionHate at IL_00df),
+        // while the refusal returns false at IL_005d having touched nothing, so a
+        // refused call gained nobody any hate. Reporting the arithmetic anyway was a
+        // number the campaign did not hold.
+        //
+        // `tier` is the module's tier read before the destruction, not the module,
+        // because the destruction replaces the module's template with a wreckage
+        // entry and the tier goes with it. See the read at the call site. Null when
+        // that read threw, and then `applied` is null too: the arithmetic has no
+        // number to work from and a zero here would read as "the engine applied
+        // none", which is a different claim.
+        static JObject HateToken(JToken tier, bool enabled, float requested,
+            bool destroyed)
         {
             var o = new JObject();
             o["requested"] = Num(requested);
             o["enabled"] = enabled;
-            Put(o, "tier", delegate { return (JToken)module.tier; });
+            o["tier"] = tier;
             Put(o, "perTierMultiplier", delegate
             {
                 return Num(TemplateManager.global
                     .factionHateMultiplierPerModuleDestroyedPerTier);
             });
-            o["applied"] = !enabled ? Num(0f) : Safe<JToken>(delegate
+            if (!(enabled && destroyed))
+                o["applied"] = Num(0f);
+            else if (tier == null || tier.Type != JTokenType.Integer)
+                o["applied"] = JValue.CreateNull();
+            else
             {
-                return Num(module.tier * TemplateManager.global
-                    .factionHateMultiplierPerModuleDestroyedPerTier);
-            }, JValue.CreateNull());
+                int tierValue = (int)tier;
+                o["applied"] = Safe<JToken>(delegate
+                {
+                    return Num(tierValue * TemplateManager.global
+                        .factionHateMultiplierPerModuleDestroyedPerTier);
+                }, JValue.CreateNull());
+            }
             return o;
+        }
+
+        // Somewhere else to point primaryHab while the protected module is
+        // destroyed. Any live hab of the same faction will do, because the engine
+        // tests identity against the one being worked on and nothing else in the
+        // call reads the field. Null when the faction has no other hab, which is
+        // equally good: the identity test fails against null too.
+        static TIHabState OtherHab(TIFactionState faction, TIHabState except)
+        {
+            return Safe<TIHabState>(delegate
+            {
+                List<TIHabState> habs = faction.habs;
+                if (habs == null) return null;
+                for (int i = 0; i < habs.Count; i++)
+                {
+                    TIHabState hab = habs[i];
+                    if (hab == null || hab == except) continue;
+                    if (hab.archived) continue;
+                    return hab;
+                }
+                return null;
+            }, null);
         }
 
         static int ModuleCount(TIHabState hab, bool okayOnly)
@@ -375,6 +648,26 @@ namespace TerraInvictaMCP
                     ? hab.OkayModules() : hab.PresentModules();
                 return list != null ? list.Count : 0;
             }, -1);
+        }
+
+        // A hab id quoted inside a refusal that is about some OTHER argument.
+        // ById throws a VerbError of its own, so resolving the hab while building
+        // the message replaces "pass 'module' as a state id" with "no TIHabState
+        // with id N" and sends the caller at the wrong argument -- which is the
+        // exact failure these refusals exist to prevent. The listing is a hint, so
+        // a hab id that does not resolve says so and the refusal it decorates
+        // survives intact.
+        static string ModuleListFor(int habId)
+        {
+            TIHabState hab = Safe<TIHabState>(delegate
+            {
+                return GameStateManager.FindGameState<TIHabState>(
+                    new GameStateID(habId), true);
+            }, null);
+            if (hab == null)
+                return "arg 'hab' (" + habId + ") is no TIHabState, so its "
+                    + "modules cannot be listed";
+            return ModuleList(hab);
         }
 
         static string ModuleList(TIHabState hab)

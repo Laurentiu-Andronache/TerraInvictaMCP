@@ -1033,15 +1033,40 @@ namespace TerraInvictaMCP
             if (raw.Type == JTokenType.Float && !Fractional(p.type))
                 throw new VerbError("argument '" + p.info.Name + "' is " + TypeLabel(p.type)
                     + " and takes a whole number; received " + Received(raw));
+            // JSON.NET reads the non-standard NaN, Infinity and -Infinity literals as
+            // floats, and a big enough exponent becomes an infinity on its own. Every
+            // range test after this point is a comparison, and a comparison against NaN
+            // is false in both directions, so a nonfinite value reaches the game as it
+            // is and sits in campaign state that nothing later can undo.
+            double number;
+            // The cast is inside a try of its own because a number too large for a
+            // double at all -- JSON.NET keeps one as a BigInteger -- failed inside
+            // the conversion below before and has to answer the same way now.
+            try { number = (double)raw; }
+            catch (Exception) { throw OutOfRange(p, raw); }
+            if (double.IsNaN(number) || double.IsInfinity(number))
+                throw new VerbError("argument '" + p.info.Name + "' must be a finite "
+                    + "number; received " + Received(raw));
+            object coerced;
             try
             {
-                return Convert.ChangeType((double)raw, p.type, CultureInfo.InvariantCulture);
+                coerced = Convert.ChangeType(number, p.type, CultureInfo.InvariantCulture);
             }
             catch (Exception)
             {
-                throw new VerbError("argument '" + p.info.Name + "': " + Received(raw)
-                    + " is out of range for " + TypeLabel(p.type));
+                throw OutOfRange(p, raw);
             }
+            // Convert.ToSingle answers Infinity for a double past float's range instead
+            // of throwing, so the overflow the catch above is written for arrives as a
+            // value rather than as an exception.
+            if (coerced is float && float.IsInfinity((float)coerced)) throw OutOfRange(p, raw);
+            return coerced;
+        }
+
+        static VerbError OutOfRange(ActionParam p, JToken raw)
+        {
+            return new VerbError("argument '" + p.info.Name + "': " + Received(raw)
+                + " is out of range for " + TypeLabel(p.type));
         }
 
         static bool Fractional(Type t)

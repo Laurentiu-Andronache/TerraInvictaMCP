@@ -18,10 +18,16 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge       # noqa: E402
+import codestate    # noqa: E402
 import resources    # noqa: E402
 import tools        # noqa: E402
 
-SERVER_INFO = {"name": "terra-invicta", "version": "0.1.0"}
+# Everything this server runs is loaded by now. Pin the bytes each module came
+# from: from here on, an edit to server/*.py is a difference this process can
+# see and report, instead of an invisible one that only a reconnect applies.
+codestate.note()
+
+SERVER_INFO = {"name": "terra-invicta", "version": "0.1.1"}
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 
 INSTRUCTIONS = """\
@@ -72,7 +78,10 @@ unresolved combat FREEZE the strategy clock -- no time passes at any speed
 until they are cleared. A "hung" run is a blocked run. `advance` owns the
 unattended loop (max speed, run_until, neutral prompt dismissal, combat
 autoresolve) and returns early with the alert text and options when a real
-decision blocks; decide with `alert_choose`, then call `advance` again.
+decision blocks; decide with `alert_choose`, then call `advance` again. It
+answers narrative event popups on its own and lists each one, with the option
+taken, under `narrativeEvents` -- read that key rather than assuming no story
+event fired.
 
 Launch cycle: the game_start/game_stop tools own it on every platform.
 `game_start` launches through Steam and polls the bridge up (20-60s).
@@ -125,10 +134,31 @@ def make_progress(token):
 
 
 def handle(msg):
-    method = msg.get("method")
+    """Dispatch one client message. Anything that is not an addressable
+    request is consumed silently.
+
+    A client may send any JSON at all, and every field read here is read off
+    something it chose: an envelope that is not an object, `params` that is a
+    scalar, a `_meta` that is a number. Each is checked before it is indexed,
+    because an AttributeError here would otherwise reach the read loop and end
+    the process.
+    """
+    if not isinstance(msg, dict):
+        # Not a JSON-RPC message: no id to answer to and no method to
+        # dispatch, so it gets the same treatment as an unparseable line.
+        return
     msg_id = msg.get("id")
+    if msg_id is None:
+        # A notification. JSON-RPC forbids answering one, `ping` included, and
+        # the only notifications a client sends this server are lifecycle
+        # ones that need no work done for them.
+        return
+    method = msg.get("method")
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        params = {}
     if method == "initialize":
-        client_ver = (msg.get("params") or {}).get("protocolVersion")
+        client_ver = params.get("protocolVersion")
         ver = client_ver if client_ver in PROTOCOL_VERSIONS \
             else PROTOCOL_VERSIONS[0]
         reply(msg_id, {"protocolVersion": ver,
@@ -138,30 +168,29 @@ def handle(msg):
     elif method == "tools/list":
         reply(msg_id, {"tools": tools.TOOL_DEFS})
     elif method == "tools/call":
-        params = msg.get("params") or {}
-        token = (params.get("_meta") or {}).get("progressToken")
+        meta = params.get("_meta")
+        token = meta.get("progressToken") if isinstance(meta, dict) else None
         progress = make_progress(token) if token is not None else None
         reply(msg_id, tools.handle_call(params.get("name", ""),
-                                        params.get("arguments") or {},
+                                        params.get("arguments"),
                                         progress))
     elif method == "resources/list":
         reply(msg_id, resources.list_resources())
     elif method == "resources/read":
-        uri = (msg.get("params") or {}).get("uri", "")
+        uri = params.get("uri", "")
         try:
             reply(msg_id, resources.read_resource(uri))
-        except KeyError:
+        except (KeyError, TypeError):
             reply(msg_id, error={"code": -32002,
-                                 "message": "resource not found: %s" % uri})
+                                 "message": "resource not found: %s" % (uri,)})
         except OSError as e:
             reply(msg_id, error={"code": -32603,
                                  "message": "cannot read %s: %s" % (uri, e)})
     elif method == "ping":
         reply(msg_id, {})
-    elif msg_id is not None:
+    else:
         reply(msg_id, error={"code": -32601,
-                             "message": "method not found: %s" % method})
-    # notifications (no id) are consumed silently
+                             "message": "method not found: %s" % (method,)})
 
 
 def main():
@@ -173,7 +202,20 @@ def main():
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        handle(msg)
+        try:
+            handle(msg)
+        except Exception as e:
+            # One client message must never end the session. Everything
+            # queued behind a bad line is other work, usually from the same
+            # agent, and a dead stdio server reads to it as a tool that
+            # vanished rather than a request it got wrong. Answer the request
+            # if it can be addressed; drop it if it cannot.
+            msg_id = msg.get("id") if isinstance(msg, dict) else None
+            if msg_id is not None:
+                reply(msg_id, error={
+                    "code": -32603,
+                    "message": "internal error handling %s: %s"
+                               % (type(e).__name__, e)})
 
 
 USAGE = """\

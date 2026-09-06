@@ -45,10 +45,17 @@ enforces it.
   folder. `install.sh` also repairs the game install and registers MCP clients. Run
   it when you want those tasks, not as part of a build.
 - Run `python3 server/stdio_selfcheck.py` after any Python change. It needs no running game.
-- Run `python3 -m unittest discover -s server/tests` after any change to `server/modcheck.py`.
-  Modcheck is the tool that checks a mod's templates merged correctly into the game.
-  It runs the checks against a synthetic install in a temporary directory. It needs no
+- Run `python3 -m unittest discover -s server/tests` after any change under
+  `server/`. It covers modcheck, the tool that checks a mod's templates merged
+  correctly into the game, against a synthetic install in a temporary directory; the
+  advance loop's decision helpers; the JSON-RPC read loop; the bridge's failure paths
+  and envelope contract; the tool table's annotations; and save discovery. It needs no
   game and no bridge. `.github/workflows/ci.yml` runs it on every PR.
+- An edit to `server/*.py` does not reach a client that already started the
+  server. That Python process holds the code it read at launch until the
+  client reconnects it, and restarting the game reattaches the same stale one.
+  `selftest` reports this under `offline.serverCode` and fails the call;
+  `observe` names it when it happens.
 - `python3 server/modcheck.py [check] [mod]` is the debug entry for modcheck. It is the only
   way to run modcheck without an MCP client.
 

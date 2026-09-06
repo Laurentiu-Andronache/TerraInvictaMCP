@@ -795,5 +795,253 @@ namespace TerraInvictaMCP
         }
 
         #endregion
+
+        #region faction.relations
+
+        // How one faction feels about another, read and written.
+        //
+        // Faction hate is the last piece of campaign state with no headless path.
+        // No console command sets one; war, control_points and the spawn verbs
+        // write engine state directly and never touch it; and the only in-game
+        // route is playing until the two factions have reasons. So an AI reaction
+        // that keys off hate -- a war declaration, a refused trade, the alien
+        // response -- could not be set up and therefore could not be tested.
+        //
+        // The setter is TIFactionState.SetFactionHate(other, value, cantConflagrate,
+        // cause), which is a wrapper: it takes the difference from the current
+        // value and hands it to GainFactionHate as a delta, with randomize false
+        // (IL_0000-IL_002b), so nothing here is a partial or noisy write. What
+        // GainFactionHate then does to that delta is why every number in the reply
+        // is read back rather than echoed:
+        //   - it returns at once, writing nothing, when the pair are permanent
+        //     allies (IL_0009-IL_0012). Refused here rather than reported as a set.
+        //   - an alien faction's positive delta is scaled by 0.6 unless the aliens
+        //     have gone loud (IL_0059-IL_006f).
+        //   - the result is clamped to MinimumFactionHate..MaximumFactionHate for
+        //     the pair (IL_0071-IL_00b1). The maximum is +Infinity for a human
+        //     subject and a real ceiling for the alien faction.
+        //   - an alien subject also pushes the target's assessed alien hate
+        //     (IL_00f5-IL_0100).
+        //   - and unless cantConflagrate is set, the change spreads to the alien
+        //     proxy and the alien appeaser and back again (IL_0105 jumps the whole
+        //     cascade when it is true).
+        static JToken FactionRelations(JObject args)
+        {
+            TIFactionState subject = RelationsSubject(args);
+            JToken other = args != null ? args["other"] : null;
+            if (other == null || other.Type == JTokenType.Null)
+            {
+                if (args != null && args["hate"] != null
+                    && args["hate"].Type != JTokenType.Null)
+                    throw new VerbError("arg 'hate' needs an 'other': hate is held "
+                        + "per pair and there is no faction-wide value to set. "
+                        + "Nothing was changed");
+                return RelationsList(subject);
+            }
+
+            TIFactionState target = Arg<TIFactionState>(args, "other");
+            // == on a game state is the engine's own operator, an id comparison
+            // rather than reference equality.
+            if (subject == target)
+                throw new VerbError("'faction' and 'other' are the same faction ("
+                    + (int)subject.ID + "); hate is held between two. Nothing was "
+                    + "changed");
+
+            JToken wanted = args["hate"];
+            if (wanted == null || wanted.Type == JTokenType.Null)
+                return RelationsPair(subject, target);
+
+            float value;
+            try { value = (float)wanted; }
+            catch (Exception)
+            { throw new VerbError("arg 'hate' must be a number"); }
+            // A non-finite value would land in the faction's hate dictionary and
+            // poison every later comparison against it, including the two
+            // thresholds the mood and the war checks read.
+            if (float.IsNaN(value) || float.IsInfinity(value))
+                throw new VerbError("arg 'hate' must be a finite number; nothing "
+                    + "was changed");
+            return RelationsSet(args, subject, target, value);
+        }
+
+        // The active player unless a faction is named. Reading the whole table for
+        // whoever is playing is the common call, and requiring the id for it would
+        // mean a query.factions round trip before every one.
+        static TIFactionState RelationsSubject(JObject args)
+        {
+            JToken id = args != null ? args["faction"] : null;
+            if (id != null && id.Type != JTokenType.Null)
+                return Arg<TIFactionState>(args, "faction");
+            TIFactionState player = Safe<TIFactionState>(delegate
+            {
+                GameControl control = GameControl.control;
+                return control != null ? control.activePlayer : null;
+            }, null);
+            if (player == null)
+                throw new VerbError("no active player faction to read relations "
+                    + "for; pass 'faction' as a faction state id");
+            return player;
+        }
+
+        static JToken RelationsList(TIFactionState subject)
+        {
+            var o = new JObject();
+            o["faction"] = Describe(subject);
+            o["thresholds"] = HateThresholds();
+            var rows = new JArray();
+            TIFactionState[] factions = GameStateManager.AllFactions();
+            for (int i = 0; factions != null && i < factions.Length; i++)
+            {
+                TIFactionState f = factions[i];
+                if (f == null || f == subject) continue;
+                rows.Add(RelationRow(subject, f));
+            }
+            o["relations"] = rows;
+            return o;
+        }
+
+        static JToken RelationsPair(TIFactionState subject, TIFactionState target)
+        {
+            var o = new JObject();
+            o["faction"] = Describe(subject);
+            o["thresholds"] = HateThresholds();
+            o["relation"] = RelationRow(subject, target);
+            return o;
+        }
+
+        // Both directions, because hate is not symmetric: each faction keeps its
+        // own dictionary and a one-sided reading reads as a mutual state that is
+        // not there.
+        static JToken RelationRow(TIFactionState subject, TIFactionState target)
+        {
+            var o = new JObject();
+            o["faction"] = Describe(target);
+            Put(o, "hate", delegate
+            { return Num(subject.GetFactionHate(target)); });
+            Put(o, "hateFromThem", delegate
+            { return Num(target.GetFactionHate(subject)); });
+            // The engine's own word for the pair's state, from the same two
+            // thresholds: "Tolerance", "Conflicted" or "War".
+            Put(o, "mood", delegate
+            { return (JToken)subject.GetDiplomacyMood(target); });
+            Put(o, "moodFromThem", delegate
+            { return (JToken)target.GetDiplomacyMood(subject); });
+            Put(o, "min", delegate
+            { return Num(subject.MinimumFactionHate(target)); });
+            Put(o, "max", delegate
+            { return Num(subject.MaximumFactionHate(target)); });
+            Put(o, "permanentAlly", delegate
+            { return (JToken)subject.permanentAlly(target); });
+            return o;
+        }
+
+        static JToken HateThresholds()
+        {
+            var o = new JObject();
+            Put(o, "conflict", delegate
+            { return Num(TemplateManager.global.factionHateConflictThreshold); });
+            Put(o, "war", delegate
+            { return Num(TemplateManager.global.factionHateWarThreshold); });
+            return o;
+        }
+
+        static JToken RelationsSet(JObject args, TIFactionState subject,
+            TIFactionState target, float value)
+        {
+            // Refused rather than attempted: GainFactionHate returns before its
+            // first write for a permanent ally, so the call would report a set that
+            // never happened.
+            if (Safe<bool>(delegate { return subject.permanentAlly(target); }, false))
+                throw new VerbError("the two factions are permanent allies "
+                    + "(TIFactionState.permanentAlly), and GainFactionHate returns "
+                    + "before writing anything for that pair. Nothing was changed");
+
+            bool cantConflagrate = Flag(args, "cant_conflagrate");
+            string cause = Str(args, "cause");
+            if (string.IsNullOrEmpty(cause)) cause = HateSetCause;
+
+            // The delta the wrapper will compute, because three of the engine's
+            // behaviours below key off its sign rather than off the new value.
+            float was = Safe<float>(
+                delegate { return subject.GetFactionHate(target); }, 0f);
+            float delta = value - was;
+            bool alien = Safe<bool>(
+                delegate { return subject.IsAlienFaction; }, false);
+
+            var o = new JObject();
+            o["faction"] = Describe(subject);
+            o["other"] = Describe(target);
+            o["requested"] = Num(value);
+            o["delta"] = Num(delta);
+            o["cause"] = cause;
+            o["cantConflagrate"] = cantConflagrate;
+            o["before"] = RelationRow(subject, target);
+
+            try { subject.SetFactionHate(target, value, cantConflagrate, cause); }
+            catch (Exception e)
+            {
+                throw new VerbError("SetFactionHate threw: " + Note(e)
+                    + ". The value may be partly written; call this verb with no "
+                    + "'hate' to read the pair back");
+            }
+
+            o["after"] = RelationRow(subject, target);
+            float applied = Safe<float>(
+                delegate { return subject.GetFactionHate(target); }, value);
+            o["hate"] = Num(applied);
+            // Compared with a tolerance rather than exactly. SetFactionHate goes
+            // through GainFactionHate, which stores dict[other] + (value - old)
+            // rather than assigning the value, so an ordinary write comes back a
+            // few ten-millionths off: 0.1 asked of a table holding 47.3 reads
+            // 0.09999847. An exact test calls that write unapplied and the note
+            // below then blames a clamp that never fired. A thousandth is far
+            // below anything the engine's own clamps move.
+            const float appliedTolerance = 1e-3f;
+            bool landed = Math.Abs(applied - value) <= appliedTolerance;
+            o["applied"] = landed;
+
+            var notes = new List<string>();
+            if (!landed)
+            {
+                string why = "GainFactionHate clamps the result to this pair's "
+                    + "MinimumFactionHate..MaximumFactionHate";
+                if (alien && delta > 0f)
+                    why += ", and an alien faction's increase is scaled by 0.6 "
+                        + "before that unless the aliens have gone loud";
+                notes.Add("the value read back is " + Fmt(applied) + " against the "
+                    + Fmt(value) + " asked for: " + why);
+            }
+            if (alien)
+            {
+                notes.Add("the subject is the alien faction, so the change also "
+                    + "moved the target's assessed alien hate, which is the number "
+                    + "the target's own screens show");
+                Put(o, "assessedAlienHate", delegate
+                { return Num(target.GetEstimatedAlienHate()); });
+            }
+            // The cascade runs only on an increase: GainFactionHate returns at
+            // IL_0111 for a delta of zero or less, before it reaches any of the
+            // proxy and appeaser arms.
+            if (!cantConflagrate && delta > 0f)
+                notes.Add("cant_conflagrate was not set and this was an increase, "
+                    + "so the engine also spread the change to the alien proxy and "
+                    + "the alien appeaser under their own rules; pass "
+                    + "cant_conflagrate=true to keep the write to this one pair");
+            if (notes.Count > 0)
+                o["note"] = string.Join("; ", notes.ToArray());
+            return o;
+        }
+
+        // The label the resource and diplomacy logs carry for a value this verb
+        // forced. SetFactionHate's own default is "Hard Set", which says nothing
+        // about who did it.
+        const string HateSetCause = "Bridge Set";
+
+        static string Fmt(float f)
+        {
+            return f.ToString("0.##", CultureInfo.InvariantCulture);
+        }
+
+        #endregion
     }
 }

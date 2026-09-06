@@ -79,6 +79,14 @@ namespace TerraInvictaMCP
 
         public static bool Engaged { get { return engaged; } }
 
+        // The faction the engagement holds, or null. Read by the combat machine, which
+        // has to know that this one faction reports isActivePlayer false while the
+        // engine's own UI still treats it as the player.
+        internal static TIFactionState EngagedFaction
+        {
+            get { return engaged ? faction : null; }
+        }
+
         // ---- verb ------------------------------------------------------------
 
         internal static JToken Control(string action, string smart)
@@ -296,16 +304,64 @@ namespace TerraInvictaMCP
             catch (Exception e) { Server.LastError = Verbs.Note(e); }
         }
 
-        // A MonoBehaviour with no singleton accessor, so this is a scene lookup.
-        // Called once per engage, never per frame.
+        // The macro's own on/off switch, which is Autopilot.Activated and not the
+        // component's enabled state: Autopilot.Update's first act is to return when
+        // Activated is false, and the component sits in the scene enabled either way,
+        // so the enabled state answers "is the class loaded" rather than "is the macro
+        // playing the faction".
         static bool MacroAutopilotRunning()
         {
             try
             {
-                var macro = UnityEngine.Object.FindObjectOfType<Autopilot>();
-                return macro != null && macro.isActiveAndEnabled;
+                Autopilot macro = Macro();
+                return macro != null && macro.Activated;
             }
             catch (Exception) { return false; }
+        }
+
+        // Autopilot.Start assigns the singleton, so the field is the cheap path and
+        // the scene walk is the fallback for a frame before Start has run.
+        static Autopilot Macro()
+        {
+            try
+            {
+                Autopilot macro = Autopilot.Singleton;
+                if (macro != null) return macro;
+            }
+            catch (Exception) { }
+            try { return UnityEngine.Object.FindObjectOfType<Autopilot>(true); }
+            catch (Exception) { return null; }
+        }
+
+        // The macro's engaged state, read rather than assumed.
+        //
+        // Autopilot.LogCallback clears `activated` and pauses the clock on the first
+        // LogType.Exception unless IgnoreExeptions is set (the engine spells the field
+        // that way). Nothing else reports that, so an unattended run that switched the
+        // macro on and walked away keeps resuming a clock nobody is driving. This is
+        // the read that catches it, and ignoreExceptions is reported beside it so a
+        // caller can see whether the switch it depends on was ever armed.
+        internal static JToken MacroStatus()
+        {
+            var o = new JObject();
+            Autopilot macro = Macro();
+            o["present"] = macro != null;
+            if (macro == null)
+            {
+                o["activated"] = false;
+                o["note"] = "no Autopilot component in the scene, so the macro has "
+                    + "never run in this session";
+                return o;
+            }
+            try { o["activated"] = macro.Activated; }
+            catch (Exception) { o["activated"] = JValue.CreateNull(); }
+            try { o["ignoreExceptions"] = macro.IgnoreExeptions; }
+            catch (Exception) { o["ignoreExceptions"] = JValue.CreateNull(); }
+            try { o["saveRate"] = macro.SaveRate; }
+            catch (Exception) { o["saveRate"] = JValue.CreateNull(); }
+            try { o["cycleIndex"] = macro.CycleIndex; }
+            catch (Exception) { o["cycleIndex"] = JValue.CreateNull(); }
+            return o;
         }
 
         static TIGlobalValuesState SafeGlobalValues()
@@ -492,12 +548,25 @@ namespace TerraInvictaMCP
         // again.
         static bool StartMissionPhasePrefix(TIMissionPhaseState __instance)
         {
-            if (!engaged || __instance == null) return true;
+            if (__instance == null) return true;
             try
             {
                 TIDateTime skip = __instance.skipTime;
                 TIDateTime now = TITimeState.Now();
                 if (skip != null && now != null && skip.Equals(now)) return true;
+                if (!engaged)
+                {
+                    // Not engaged, so nothing is deferred and the engine runs
+                    // exactly as it would without this mod. The count is the
+                    // whole point: past this line vanilla logs "fired when
+                    // mission phase was already active", clears phaseActive and
+                    // returns with factionsSignallingComplete still populated,
+                    // which is the corruption. query.time reports it, so a run
+                    // can say whether a driver that re-armed the clock over an
+                    // open phase is what produced one.
+                    if (__instance.phaseActive) missionPhaseCollisions++;
+                    return true;
+                }
                 if (__instance.phaseActive || MissionPhaseBusy())
                 {
                     deferredPhaseTicks++;
@@ -513,11 +582,39 @@ namespace TerraInvictaMCP
         // even though it is harmless.
         static int deferredPhaseTicks;
 
+        // The engaged deferral and this counter can never both move on one tick:
+        // the deferral returns false before the engine reaches its own guard, so
+        // deferredPhaseTicks counts collisions prevented and this one counts
+        // collisions taken.
+        static int missionPhaseCollisions;
+
+        internal static int MissionPhaseCollisions
+        {
+            get { return missionPhaseCollisions; }
+        }
+
+        // Called from the two verbs that unload a campaign. The count describes
+        // one campaign's run; carrying it into the next one would report a
+        // collision that happened somewhere else.
+        internal static void ResetMissionPhaseCollisions()
+        {
+            missionPhaseCollisions = 0;
+        }
+
         // Called from OnUnload. The assembly is about to be replaced, so anything
         // still held has to come back now.
         internal static void ReleaseForUnload()
         {
             try { Release("released on unload"); }
+            catch (Exception) { }
+        }
+
+        // Called when the campaign the engagement is bound to is being unloaded
+        // on purpose (game.main_menu). The patches read one faction of one
+        // campaign, and that campaign's states are about to be cleared.
+        internal static void ReleaseForCampaignEnd()
+        {
+            try { Release("released on return to the main menu"); }
             catch (Exception) { }
         }
 
@@ -873,6 +970,13 @@ namespace TerraInvictaMCP
             // asks for the campaign's own difficulty.
             string smart = Text(args, "smart", "brutal");
             return AiControl.Control(action, smart);
+        }
+
+        // The vanilla autopilot macro's state. Separate from ai.control, which owns the
+        // engagement: these are two different drivers and a run can have either.
+        static JToken QueryAutopilot(JObject args)
+        {
+            return AiControl.MacroStatus();
         }
 
         static string Text(JObject args, string key, string fallback)

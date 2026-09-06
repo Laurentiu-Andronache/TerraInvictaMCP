@@ -1184,7 +1184,13 @@ class Universe:
                         "winnerTags": list(prev_tags), "loserTags": list(tags)})
                     # first-registered-wins: the earlier entry stays live
                     continue
-                bucket[dn] = entry
+                # A copy: vanilla_entries hands out the module-level cache's
+                # own dicts, and everything downstream of here writes into the
+                # universe -- the mod merge, and the live overlay that
+                # replaces disk values with the engine's. A write reaching the
+                # cache would outlive the run and land in the baseline, where
+                # it suppresses the finding it created.
+                bucket[dn] = dict(entry)
                 self.tags[key] = tags
                 self.origin[key] = label
 
@@ -1217,8 +1223,12 @@ class Universe:
                             merged = merge_value(bucket[dn], entry,
                                                  mf.array_mode)
                         bucket[dn] = merged
-                        if "scenarioTags" in entry:
-                            self.tags[key] = entry.get("scenarioTags") or []
+                        # Read off the merged entry, unconditionally. The
+                        # mod's own patch carries scenarioTags only when it
+                        # sets them, and the two disagree in both directions:
+                        # a field merge that leaves vanilla's tags alone, and
+                        # a whole replacement that drops them.
+                        self.tags[key] = merged.get("scenarioTags") or []
                         self.origin.setdefault(key, "mod:" + mod.name)
 
             # Drop entries whose merged disable is true: TemplateManager never
@@ -1917,11 +1927,21 @@ def _ref_findings(universe, session=None):
     return findings, meta
 
 
+# Bumped whenever a defect could have written findings into a baseline file
+# that vanilla alone would not produce: a file at any other value recomputes
+# once, the way a game version change does. 1 retires every baseline written
+# while the live overlay could still write engine values into the vanilla
+# cache, since those runs recorded engine-only findings as pre-existing.
+BASELINE_FORMAT = 1
+
+
 def _load_baseline(version, enum_fingerprint):
     try:
         with open(BASELINE_PATH) as f:
             data = json.load(f)
     except (OSError, ValueError):
+        return None
+    if data.get("format") != BASELINE_FORMAT:
         return None
     if data.get("gameVersion") != version:
         return None
@@ -1947,6 +1967,7 @@ def _compute_baseline(version, session=None):
     ref_findings, _ = _ref_findings(uni, session)
     reach_findings, _ = _reach_findings(uni)
     base = {
+        "format": BASELINE_FORMAT,
         "gameVersion": version,
         "enumFingerprint": fingerprint,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2081,7 +2102,9 @@ def _overlay_bridge_bulk(session, uni, degraded):
                     dn = e.get("dataName")
                     if not dn:
                         continue
-                    merged = bucket.get(dn, {"dataName": dn})
+                    # A copy, so the overlay's engine-sourced values are
+                    # written into this universe and nowhere else.
+                    merged = dict(bucket.get(dn) or {"dataName": dn})
                     for f in fields:
                         if f in e:
                             merged[f] = e[f]
@@ -2686,14 +2709,36 @@ def check_reach(session, only_mod, scenario, verbose):
 
 # ---------------------------------------------------------------- save_check
 
+# Both formats the game writes: a profile setting decides which, and the DLL
+# lists and resolves saves by the same pair (SaveExtensions in src/Verbs.cs).
+# Reading only .gz here made a save the game had just written invisible.
+SAVE_EXTENSIONS = (".gz", ".json")
+
+
 def _list_saves():
+    """Save file names, newest first, in either format."""
     try:
         return sorted(
-            (f for f in os.listdir(SAVES_DIR) if f.endswith(".gz")),
+            (f for f in os.listdir(SAVES_DIR)
+             if f.endswith(SAVE_EXTENSIONS)),
             key=lambda f: os.path.getmtime(os.path.join(SAVES_DIR, f)),
             reverse=True)
     except OSError:
         return []
+
+
+def _resolve_save(name, saves):
+    """The save `name` refers to, or None. Accepts the file name as it sits on
+    disk and the bare name the game shows, which is the same name for a `.gz`
+    and a `.json` save; `saves` is newest first, so a bare name that matches
+    both resolves to the one written last."""
+    if name in saves:
+        return name
+    for f in saves:
+        base, ext = os.path.splitext(f)
+        if ext in SAVE_EXTENSIONS and base == name:
+            return f
+    return None
 
 
 def save_check(name=None):
@@ -2707,16 +2752,19 @@ def save_check(name=None):
             "error": "no saves found in %s" % SAVES_DIR}, "verdicts": [],
             "warnings": [], "lints": []}
     if name:
-        fname = name if name.endswith(".gz") else name + ".gz"
-        if fname not in saves:
+        fname = _resolve_save(name, saves)
+        if fname is None:
             return {"status": "FAIL", "summary": {
                 "error": "no save named %r" % name, "saves": saves[:20]},
                 "verdicts": [], "warnings": [], "lints": []}
     else:
         fname = saves[0]
     path = os.path.join(SAVES_DIR, fname)
+    # An uncompressed save is plain JSON on disk; only the .gz form goes
+    # through gzip.
+    opener = gzip.open if fname.endswith(".gz") else open
     try:
-        with gzip.open(path, "rt", encoding="utf-8-sig", errors="replace") as f:
+        with opener(path, "rt", encoding="utf-8-sig", errors="replace") as f:
             data = json.load(f)
     except (OSError, ValueError, EOFError) as e:
         return {"status": "FAIL", "summary": {

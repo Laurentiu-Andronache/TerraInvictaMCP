@@ -10,6 +10,7 @@ import json
 import os
 import re
 import socket
+import time
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 17470
@@ -106,6 +107,18 @@ class BridgeError(Exception):
     """The bridge could not be reached or answered garbage (transport layer)."""
 
 
+class BridgeTimeout(BridgeError):
+    """The socket was established but no reply arrived inside the timeout.
+
+    A subclass of BridgeError so every existing handler keeps catching it, and
+    distinct so the ones that care can tell a slow main thread from a dead
+    game. The game answers every verb on the main thread, so one long stall --
+    a large save, an asset load, a scene change -- times a call out while the
+    process is perfectly alive. Reporting that as "the game is not running,
+    call game_start" is false and sends the caller to relaunch a running game.
+    """
+
+
 class VerbError(Exception):
     """The bridge answered ok:false; the message is the bridge's error string."""
 
@@ -119,10 +132,79 @@ def resolve_port(cli_override=None):
 _ids = itertools.count(1)
 _verb_cache = None
 
+# The last clock stall the DLL reported, and when this process read it. Every
+# response envelope carries `clockStall`, so a session's ordinary traffic keeps
+# this fresh for nothing: the pause limit reads it here instead of asking the
+# game on every tool call.
+#
+# `seconds` is None when there is nothing to measure -- no campaign loaded, or
+# a DLL older than the key -- and that is deliberately indistinguishable from
+# "unknown", because both mean the limit has nothing to enforce. `at` is the
+# monotonic time of the last reply of any kind, set even when the key was
+# absent, so an old DLL is asked once and then left alone.
+_stall = {"seconds": None, "at": None}
+
+
+def _note_stall(resp):
+    if not isinstance(resp, dict):
+        return
+    value = resp.get("clockStall")
+    ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+    _stall["seconds"] = float(value) if ok else None
+    _stall["at"] = time.monotonic()
+
+
+def clear_stall():
+    """Forget the reading, and count the forgetting as a reading of its own.
+
+    `at` is set rather than cleared: "we looked and there is nothing to
+    measure" must not read as "we have never looked", or the gate refreshes on
+    every call for as long as no campaign is loaded.
+    """
+    _stall["seconds"] = None
+    _stall["at"] = time.monotonic()
+
+
+def last_stall():
+    """(seconds, age in seconds) of the last stall reading; either may be None.
+
+    An age of None means no reply has been read in this process yet, which is
+    what the caller refreshes on.
+    """
+    at = _stall["at"]
+    age = None if at is None else max(0.0, time.monotonic() - at)
+    return _stall["seconds"], age
+
+
+def _check_reply(request, resp):
+    """The envelope contract, checked once for every caller.
+
+    A reply is a JSON object that echoes the request id and says whether the
+    verb succeeded. Checked here rather than in call(), because the debug
+    --call path and modcheck's own session read the envelope themselves, and a
+    reply that is an array or is missing `ok` reads to them as a verb that
+    quietly did nothing instead of a bridge that answered garbage. A
+    mismatched id means this reply belongs to some other request, which makes
+    every field in it the wrong answer to the question asked.
+    """
+    if not isinstance(resp, dict):
+        raise BridgeError("malformed bridge response: %r" % (resp,))
+    if "ok" not in resp:
+        raise BridgeError("bridge response carries no 'ok' field: %r"
+                          % (resp,))
+    want = request.get("id") if isinstance(request, dict) else None
+    if want is not None and resp.get("id") != want:
+        # The DLL answers a request it could not parse with id 0, so its own
+        # error message rides along rather than being replaced by this one.
+        detail = resp.get("error")
+        raise BridgeError("bridge answered id %r for request id %r%s"
+                          % (resp.get("id"), want,
+                             ": %s" % (detail,) if detail else ""))
+
 
 def send(request, timeout=TIMEOUT, port=None):
-    """One NDJSON request, one reply. Raises BridgeError on any transport
-    or parse failure."""
+    """One NDJSON request, one reply. Raises BridgeError on any transport,
+    parse, or envelope-shape failure."""
     global _verb_cache
     try:
         with socket.create_connection((HOST, resolve_port(port)),
@@ -133,23 +215,58 @@ def send(request, timeout=TIMEOUT, port=None):
             line = f.readline()
         if not line:
             raise BridgeError("bridge closed the connection without a response")
-        return json.loads(line)
-    except (OSError, json.JSONDecodeError) as e:
-        # A later reconnect may reach a restarted game with a different DLL;
-        # drop the cached verb set so it gets re-detected.
+        resp = json.loads(line)
+        _check_reply(request, resp)
+        _note_stall(resp)
+        return resp
+    except socket.timeout:
+        # Caught ahead of OSError, which it inherits from. On loopback a closed
+        # port is refused instantly rather than timing out, so this is the
+        # accepted-but-unanswered case: the game is up and its main thread is
+        # busy.
         _verb_cache = None
+        clear_stall()
+        raise BridgeTimeout("no reply within %.0fs (the game's main thread is "
+                            "busy; the process is up)" % timeout)
+    except BridgeError:
+        # The EOF and shape failures raised above. They are failed calls like
+        # any other, so they discard the same state: a raise that skipped this
+        # left a cached verb set describing a bridge this call never reached.
+        _verb_cache = None
+        clear_stall()
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        # A later reconnect may reach a restarted game with a different DLL;
+        # drop the cached verb set so it gets re-detected. The stall goes with
+        # it: a call that reached nothing has learned that the last reading is
+        # no longer current, and a stale one would have the pause limit refuse
+        # calls over a clock in a game that is not running any more.
+        # UnicodeDecodeError is in the tuple because the socket is read as
+        # text: bytes that are not UTF-8 raise it, and it is a ValueError, so
+        # OSError does not cover it.
+        _verb_cache = None
+        clear_stall()
         raise BridgeError(str(e))
 
 
 def call(cmd, args=None, timeout=TIMEOUT, port=None):
     """Send one verb; return its data. Raises BridgeError (transport) or
-    VerbError (the bridge said ok:false)."""
+    VerbError (the bridge said ok:false).
+
+    The stall is read off the envelope inside send, before this raises, so a
+    failed verb still updates the reading -- those are the calls a client would
+    otherwise learn nothing from.
+    """
     resp = send({"id": next(_ids), "cmd": cmd, "args": args or {}},
                 timeout, port)
-    if not isinstance(resp, dict):
-        raise BridgeError("malformed bridge response: %r" % (resp,))
     if not resp.get("ok"):
-        raise VerbError(str(resp.get("error", resp)))
+        message = str(resp.get("error", resp))
+        # A stall belongs to a campaign and ends with it. Said explicitly
+        # rather than left to the null the envelope already carries, because
+        # the two agreeing is the invariant, not a coincidence to rely on.
+        if "no campaign" in message:
+            clear_stall()
+        raise VerbError(message)
     return resp.get("data")
 
 

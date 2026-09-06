@@ -152,18 +152,27 @@ about the ones you cannot run.
   JSON-RPC on stdout. A single stray `print` in any module the server imports
   drops every client's connection. This drives a real server and asserts the
   stream stays clean. Run it for any Python change. It needs no running game.
-- `python3 -m unittest discover -s server/tests` for changes to modcheck, the
-  tool that checks a mod's templates merged correctly into the game. The
-  suite drives its pure functions, its merge simulation and all five checks
-  against a synthetic install in a temporary directory. It needs no game, no
-  bridge and no game assemblies. CI runs it on every PR. Some cases pin
-  behavior that is wrong on purpose and say so. Fixing one means changing its
-  test in the same diff.
+- `python3 -m unittest discover -s server/tests` for any change under
+  `server/`. The suite drives modcheck's pure functions, its merge simulation
+  and all five checks against a synthetic install in a temporary directory;
+  the advance loop's decision helpers with the values the loop would have
+  computed; the JSON-RPC read loop against malformed client messages; the
+  bridge's failure paths and envelope contract against a loopback peer; the
+  tool table's annotations; and save discovery in both formats the game
+  writes. It needs no game, no bridge and no game assemblies. CI runs it on
+  every PR. Some cases pin behavior that is wrong on purpose and say so.
+  Fixing one means changing its test in the same diff.
 - `python3 server/modcheck.py [check] [mod]` for changes to modcheck. It is the
   debug entry. It runs without an MCP client. It needs the game running for
   the checks that read live state.
 - `./build.sh` for DLL changes. It writes the DLL where the game loads it from.
   This is the whole loop for a build.
+- Editing `server/*.py` does nothing to a server your client already
+  started. The client spawns that Python process once and keeps it for the
+  session, so it holds the code it read at launch until the client reconnects
+  it. Restarting the game reloads the DLL and reattaches to the same stale
+  server. `selftest` reports this as `offline.serverCode` and fails the call;
+  `observe` names it too, and only then.
 - `selftest` and `modcheck` as MCP tools are the fuller check. They are out
   of reach unless you have both a running game and an MCP client registered
   against this server. This is what `install.sh` sets up. Say so under "Show
@@ -171,7 +180,7 @@ about the ones you cannot run.
   command-line equivalent.
 - Keep `docs/PROTOCOL.md` in step with verb changes. A wire-contract change is
   a **mod version bump**. `docs/PROTOCOL.md` notes the version a verb
-  appeared in ("since 0.2.0" on its row). The version lives in three files that
+  appeared in ("since 0.1.1" on its row). The version lives in three files that
   move together: `ModInfo.json`, `Verbs.ModVersion` in `src/Verbs.cs`, and
   `SERVER_INFO` in `server/__main__.py`. `selftest` reports drift in
   `offline.versionMatch`. CI's version agreement step fails on it.

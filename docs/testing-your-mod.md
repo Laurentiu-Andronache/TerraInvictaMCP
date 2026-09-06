@@ -80,6 +80,17 @@ logs for errors. Two things to know:
   name: "trigger the Dry Hole event and pick option two" -- you do not have to wait for it
   to fire naturally.
 
+**A stopped clock is treated as a stuck test.** If game time does not move for
+five minutes, the assistant starts refusing anything that would change the
+game, and says so: a clock that has sat still that long is nearly always a
+test that has quietly wedged rather than one still working. Moving the clock
+clears it, and so does starting or loading a game. Reading keeps working the
+whole time -- values, text, logs and screenshots all still answer, with a
+warning attached. Setting up an elaborate situation can legitimately take
+longer than five minutes with time stopped, so if that is the plan, say so:
+"raise the pause limit to twenty minutes while we build this up." Advancing a
+day between setup steps works just as well.
+
 For ship mods:
 
 > "Spawn a fleet of my new ships and have them fight an alien fleet."

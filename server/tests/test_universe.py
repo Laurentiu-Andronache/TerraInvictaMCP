@@ -10,6 +10,7 @@ at once. These cases drive it through real files rather than through
 merge_value, because the ModInfo-driven part of the rule (which array mode a
 file gets, which file is replaced whole) lives in the reader, not the merge.
 """
+import shutil
 import unittest
 
 import _fixtures
@@ -204,6 +205,64 @@ class UniverseTest(_fixtures.ModcheckTestCase):
             {"dataName": "Org_Alpha", "scenarioTags": ["s2070"]}]})
         uni = self.universe()
         self.assertEqual(uni.tags[("TIOrgTemplate", "Org_Alpha")], ["s2070"])
+
+    # The tag index decides reachability, and it is a second copy of a value
+    # the merged entry already holds. The two must not be able to disagree:
+    # they did, in both directions, whenever the mod's own patch was read
+    # instead of the merge it produced. A patch that leaves scenarioTags alone
+    # left the index empty and leaked a scenario-only entry into every
+    # scenario; a whole replacement that carries no tags left the index
+    # holding vanilla's and hid a now-universal entry from the base game.
+
+    def patched_scenario_org(self, modinfo, patch):
+        """One mod patching the tagged org, installed and then removed so the
+        next merge mode starts from the same vanilla tree."""
+        folder = self.add_mod(
+            "Tags", modinfo=modinfo,
+            files={"TIOrgTemplate.json": [dict(patch,
+                                               dataName="Org_Scenario")]})
+        try:
+            return self.universe()
+        finally:
+            shutil.rmtree(folder)
+
+    def test_the_tag_index_matches_the_merged_entry(self):
+        for label, modinfo, patch in [
+                ("a merge that does not mention tags", {},
+                 {"costMoney": 41}),
+                ("a merge setting an empty tag list", {},
+                 {"scenarioTags": []}),
+                ("a merge setting tags to null", {},
+                 {"scenarioTags": None}),
+                ("a concatenated tag list",
+                 {"TemplatesToConcatArrays": ["TIOrgTemplate.json"]},
+                 {"scenarioTags": ["extra"]}),
+                ("a whole replacement carrying no tags",
+                 {"TemplatesToReplace": ["TIOrgTemplate.json"]},
+                 {"costMoney": 41})]:
+            with self.subTest(label):
+                uni = self.patched_scenario_org(modinfo, patch)
+                key = ("TIOrgTemplate", "Org_Scenario")
+                merged = uni.classes[key[0]][key[1]]
+                self.assertEqual(uni.tags[key],
+                                 merged.get("scenarioTags") or [])
+
+    def test_a_merge_that_ignores_tags_keeps_the_entry_scenario_scoped(self):
+        self.add_mod("Editor", files={"TIOrgTemplate.json": [
+            {"dataName": "Org_Scenario", "costMoney": 41}]})
+        uni = self.universe()
+        self.assertEqual(uni.tags[("TIOrgTemplate", "Org_Scenario")],
+                         ["s2070"])
+        self.assertFalse(uni_live(uni, "Org_Scenario", []))
+
+    def test_a_whole_replacement_without_tags_untags_the_entry(self):
+        self.add_mod("Owner",
+                     modinfo={"TemplatesToReplace": ["TIOrgTemplate.json"]},
+                     files={"TIOrgTemplate.json": [
+                         {"dataName": "Org_Scenario", "costMoney": 41}]})
+        uni = self.universe()
+        self.assertEqual(uni.tags[("TIOrgTemplate", "Org_Scenario")], [])
+        self.assertTrue(uni_live(uni, "Org_Scenario", []))
 
     # ------------------------------------------------------- unreadable files
 

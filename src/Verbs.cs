@@ -29,7 +29,7 @@ namespace TerraInvictaMCP
 
     public static partial class Verbs
     {
-        public const string ModVersion = "0.1.0";
+        public const string ModVersion = "0.1.1";
 
         // query.state fans out over one object's members; a ref list longer than this
         // is a graph the client should walk with more queries instead.
@@ -60,6 +60,11 @@ namespace TerraInvictaMCP
             Add(t, "saves.load", false, SavesLoad);
             // A new campaign is started from the main menu, so there is no campaign yet.
             Add(t, "campaign.new", false, CampaignNew);
+            // The way back. campaign.new is refused while a campaign is loaded, and
+            // without this the only route to the start screen was killing the
+            // process and launching again. Answers with no campaign too, where it
+            // reports that the menu is already up rather than failing.
+            Add(t, "game.main_menu", false, GameMainMenu);
             Add(t, "prompts.list", true, PromptsList);
             Add(t, "prompts.dismiss", true, PromptsDismiss);
             Add(t, "alert.choose", true, AlertChoose);
@@ -67,9 +72,31 @@ namespace TerraInvictaMCP
             Add(t, "combat.start", true, CombatStart);
             Add(t, "combat.status", true, CombatStatus);
             Add(t, "combat.autoresolve", true, CombatAutoresolve);
+            // The precombat screen's own buttons, for a combat the autoresolver cannot
+            // finish. Dropping the prompt does not clear one of those: it is the
+            // precombat canvas that freezes the clock, and only a button takes it down.
+            Add(t, "combat.precombat", true, CombatPrecombat);
+            // The player's stance on a fight nobody is autoresolving. combat.autoresolve
+            // submits one on its way past, so this exists for the other case: a fight
+            // meant to be taken by hand, where the stance prompt is what freezes the
+            // clock and no other verb answers it. action.invoke SelectCombatStance
+            // reaches the same action out of band, without the screen, the allowed-stance
+            // check or the read-back.
+            Add(t, "combat.stance", true, CombatSetStance);
             // Orbital bombardment: the one fleet order with no console command and no
             // reachable UI path for a fleet the player did not build.
             Add(t, "fleet.bombard", true, FleetBombard);
+            // Landing a fleet on a hab site, which is the only way a fleet becomes a
+            // bombardment target. No console command lands one, and the UI path is an
+            // operation ordered from the fleet's own panel, so it is out of reach for
+            // a fleet the player does not own.
+            Add(t, "fleet.land", true, FleetLand);
+            // A fleet with a transfer assigned but not yet launched. action.invoke
+            // cannot build one -- AssignOrbitalTransfer's transfer parameter is
+            // invokable nullOnly, so no real IOrbitalTransfer ever reaches it -- and
+            // no console command plans a transfer, which left the state, and every
+            // refusal that reads it, untestable.
+            Add(t, "fleet.transfer", true, FleetTransfer);
             // National policy: no console command sets one, and the UI path runs through
             // a councilor mission. These take the engine's own AI enactment instead, with
             // its legality intact.
@@ -80,17 +107,33 @@ namespace TerraInvictaMCP
             // action.invoke ConfirmPolicyAction, which is the raw bypass: no cost,
             // no eligibility, no confirm. This is the contracted path.
             Add(t, "faction.diplomacy", true, FactionDiplomacy);
+            // Faction hate, the last piece of campaign state with no headless
+            // path: no console command sets one, and war, control_points and the
+            // spawn verbs all write around it. Any AI reaction keyed off hate --
+            // a war declaration, a refused trade, the alien response -- had no
+            // way to be set up and so no way to be tested.
+            Add(t, "faction.relations", true, FactionRelations);
             // Nation stats the console cannot reach, forced directly. Unlike the
             // two policy verbs above this is a fixture: it bypasses every rule
             // that would normally move the number.
             Add(t, "nation.set_stat", true, NationSetStat);
             // Hab modules, the one destructible the console's killstate does not
-            // cover: DestroyModule needs the owning faction's Habs screen.
+            // cover: DestroyModule needs the owning faction's Habs screen. Its
+            // override_protection flag is the only way past the engine's refusal
+            // on the alien primary hab's core and wormhole modules, and it exists
+            // because that refusal makes the wormhole-loss branches unreachable
+            // and so untestable; without the flag the refusal stands as it does
+            // in play.
             Add(t, "kill.module", true, KillModule);
             // The Habitats screen's power toggle, headless: the same
             // SetPowerStatus call its action makes, gated on the screen's own
             // preconditions because the engine's coercion is silent.
             Add(t, "module.power", true, ModuleSetPower);
+            // The Habitats screen's own module build, headless: the same
+            // BuildHabModuleAction its confirm popup submits, with the engine's
+            // own upgrade-versus-new-build decision and its cost. This is the
+            // one that pays; spawn.module is the fixture that does not.
+            Add(t, "hab.build_module", true, HabBuildModule);
             // Mod inspection is campaign-free: templates and both mod loaders finish at
             // boot, long before any campaign exists.
             Add(t, "mods.list", false, ModsList);
@@ -118,18 +161,69 @@ namespace TerraInvictaMCP
             Add(t, "spawn.army", true, SpawnArmy);
             Add(t, "spawn.councilor", true, SpawnCouncilor);
             Add(t, "spawn.alien_site", true, SpawnAlienSite);
+            // Ship designs. The designer is a mouse-driven screen, so before these
+            // the only designs a test could use were the ones the campaign already
+            // held: whether a part combination is buildable at all had no headless
+            // answer. design.create builds the template by hand and runs the ten
+            // ValidTemplate predicates one at a time, because the engine's own
+            // check is a bare bool that names nothing. design.auto runs the
+            // engine's search, which is the same synchronous call the designer's
+            // AUTODESIGN button makes and is bounded by the faction's own parts.
+            // A campaign, because a design belongs to a faction state.
+            Add(t, "design.create", true, DesignCreate);
+            Add(t, "design.delete", true, DesignDelete);
+            Add(t, "design.auto", true, DesignAuto);
             // True autopilot: hands the player faction to the real faction AI.
             Add(t, "ai.control", true, AiControl_Verb);
+            // The vanilla autopilot MACRO's state. It switches itself off on the first
+            // exception unless started with IgnoreExceptions, and nothing else reports
+            // that, so a run driving it has to read this every poll.
+            Add(t, "query.autopilot", true, QueryAutopilot);
             // Reading the screen without the screen. The capture answers at the
             // main menu too, which is where a launch is verified; the tooltip
             // builders read a nation, so they need a campaign.
             Add(t, "ui.screenshot", false, UiScreenshot);
+            // The options screen's own state, and the engine's own toggle for it.
+            // Nothing else reaches that screen headlessly: the escape key only
+            // closes it, no console command opens it, and game.main_menu takes
+            // its canvas down and disables the component, so whether a campaign
+            // came back with a working options screen had no verb behind it. No
+            // campaign required: at the main menu there is no controller to find
+            // and it answers found=false rather than failing.
+            Add(t, "ui.options", false, UiOptions);
+            // The two verbs that make a screen-gated surface photographable. Most
+            // of the game's UI sits behind a view or an info screen only a mouse
+            // opens, and for a driving agent the UI is view-only: a panel no verb
+            // reaches cannot be captured and so cannot be tested at all. Both
+            // change UI state and neither touches game state. A campaign, because
+            // CanvasManager builds its screen registry when the campaign UI loads
+            // and holds nothing at the start screen.
+            Add(t, "ui.view", true, UiView);
+            Add(t, "ui.screen", true, UiScreen);
             Add(t, "ui.tooltip", true, UiTooltip);
+            // The long-form panel text behind a module or a project, from the
+            // engine's own builders. Character-exact, so a mod's own strings can
+            // be asserted where a player would actually read them. A campaign
+            // because two of the three subjects are campaign state, and the
+            // third builder reads the active player.
+            Add(t, "ui.describe", true, UiDescribe);
+            // A contested mission's chance and outcome bands, evaluated out of
+            // the mission phase. Nothing else exercises a patch on
+            // TIMissionResolution_Contested without playing to a mission and
+            // waiting for the phase to run it.
+            Add(t, "mission.evaluate", true, MissionEvaluate);
             // The whole player-action catalog, reflectively. The listing is pure
             // reflection over the loaded assembly, so it answers at the main menu;
             // invoking one writes campaign state.
             Add(t, "action.list", false, ActionList);
             Add(t, "action.invoke", true, ActionInvoke);
+            // Test fixture. Puts the game into its own crash state on purpose, so a
+            // client's crash detection and recovery can be exercised without waiting
+            // for a real defect. It ends the session: recovery is a process restart
+            // and a save reload. Needs a campaign, both because that is the state
+            // worth crashing and because HandleException dereferences a
+            // GameTimeManager that does not exist at the main menu.
+            Add(t, "test.crash_the_game", true, TestCrashTheGame);
             return t;
         }
 
@@ -144,6 +238,11 @@ namespace TerraInvictaMCP
         public static string Execute(Request req)
         {
             long id = req != null ? req.id : 0;
+            // Main thread, inside Server.Drain. Recorded before the verb runs
+            // rather than after, so a verb that takes a while does not read as
+            // a client that went quiet.
+            lastVerbAt = RealTime();
+            lastVerbKnown = true;
             try
             {
                 if (req == null) return Error(0, "empty request");
@@ -183,6 +282,11 @@ namespace TerraInvictaMCP
             var o = new JObject();
             o["id"] = id;
             o["ok"] = true;
+            // On every envelope, success and failure both: a client learns the
+            // stall from the calls it was making anyway, and the failures are
+            // exactly where it would otherwise learn nothing. Response fields
+            // may grow, so a client that does not know the key ignores it.
+            o["clockStall"] = Stall();
             o["data"] = data != null ? data : JValue.CreateNull();
             return o.ToString(Formatting.None);
         }
@@ -192,6 +296,7 @@ namespace TerraInvictaMCP
             var o = new JObject();
             o["id"] = id;
             o["ok"] = false;
+            o["clockStall"] = Stall();
             o["error"] = string.IsNullOrEmpty(message) ? "error" : message;
             return o.ToString(Formatting.None);
         }
@@ -206,7 +311,144 @@ namespace TerraInvictaMCP
             var o = new JObject();
             o["mod"] = ModVersion;
             o["game"] = Application.version;
+            // Reported here as well as on query.time because this verb answers with no
+            // campaign, and a crash caught at the main menu would otherwise be invisible
+            // to a client whose only other window on it needs one.
+            o["crashed"] = Crashed();
             return o;
+        }
+
+        // The game's own crash latch. GlobalInstaller.HandleException sets
+        // GameControl.handlingException before anything else it does, then shows the
+        // crash dialog, calls GameTimeManager.PauseAndBlock, clears every event listener
+        // and sets TIInputManager.acceptingInput false.
+        //
+        // The bridge outlives all of that -- the mod's update runs off the mod loader's
+        // own MonoBehaviour rather than the game's canvas or ECS pipeline -- so every
+        // verb keeps answering over a dead game, and the blocked clock it reports reads
+        // exactly like a modal alert. This field is the difference, and it is one static
+        // bool read: the field has a single writer in the whole assembly and no clearer,
+        // and it survives a scene load, so a save loaded into the same process comes back
+        // permanently degraded. Recovery is a process restart.
+        static JToken Crashed()
+        {
+            return Safe<JToken>(
+                delegate { return new JValue(GameControl.handlingException); },
+                JValue.CreateNull());
+        }
+
+        // The literal test.crash_the_game demands. Spelled out rather than a boolean so
+        // no client's default-filling can supply it by accident.
+        const string CrashConfirm = "crash-the-game";
+
+        // The message the crash panel and both logs will carry. It says the game did
+        // not fail on its own, because the person reading it may not be the person who
+        // ran the verb.
+        const string CrashFixtureMessage =
+            "TerraInvictaMCP test fixture: this exception was raised deliberately by "
+            + "the test.crash_the_game verb to exercise the game's crash handler. The "
+            + "game did not fail on its own. Quit, launch it again and load a save.";
+
+        // Puts the game into the crash state above, on purpose, so a client's crash
+        // detection and recovery can be tested without waiting for a real defect.
+        //
+        // UnityEngine.Debug.LogException raises Application.logMessageReceived with
+        // LogType.Exception, and that is the one LogType HandleException acts on: it
+        // compares its `type` argument against 4 and returns immediately for anything
+        // else. LogException logs rather than throws, so nothing unwinds through
+        // Execute's catch-all and this verb answers normally from a game that is
+        // already crashed. Unity dispatches the callback synchronously on the calling
+        // thread, and verbs run on the main thread, so handlingException is already set
+        // by the time LogException returns: the reply reports the flag itself rather
+        // than an intention.
+        //
+        // The console verb cannot do this. TerminalController.ParseCommand does not
+        // catch, so a throwing command propagates out of it, straight into Execute's
+        // catch-all, which turns it into an ordinary JSON error. Unity's log handler
+        // never sees it and HandleException never runs.
+        static JToken TestCrashTheGame(JObject args)
+        {
+            if (Str(args, "confirm") != CrashConfirm)
+                throw new VerbError(
+                    "test.crash_the_game ENDS THIS SESSION. It raises a real unhandled "
+                    + "exception so the game's own crash handler runs: the crash panel "
+                    + "comes up, the clock is paused and blocked, every event listener "
+                    + "is cleared and input is switched off. Nothing inside the process "
+                    + "undoes that, so recovery is quitting the game, launching it "
+                    + "again and loading a save; anything unsaved is lost. It exists to "
+                    + "test crash detection and crash recovery and has no other use. To "
+                    + "run it anyway, pass confirm=\"" + CrashConfirm + "\".");
+
+            if (Safe<bool>(delegate { return GameControl.handlingException; }, false))
+            {
+                var already = new JObject();
+                already["triggered"] = false;
+                already["crashed"] = true;
+                already["note"] =
+                    "the game is already in its crash state. handlingException is a "
+                    + "latch with no clearer, so HandleException returns immediately "
+                    + "and a second exception would change nothing. Recovery is a "
+                    + "process restart and a save reload.";
+                return already;
+            }
+
+            string blocker = CrashHandlerBlocker();
+            if (blocker != null)
+                throw new VerbError(
+                    "refusing to fire: " + blocker + ". HandleException would throw on "
+                    + "that, fall into its own catch and call GameControl.Stop, which "
+                    + "is Application.Quit outside the editor. The process would exit "
+                    + "instead of entering the crash state this fixture exists to "
+                    + "produce, and a client watching for the crash flag would see the "
+                    + "bridge disappear instead.");
+
+            UnityEngine.Debug.LogException(new Exception(CrashFixtureMessage));
+
+            var o = new JObject();
+            o["triggered"] = true;
+            o["crashed"] = Crashed();
+            o["exception"] = CrashFixtureMessage;
+            o["recovery"] =
+                "quit the game, launch it again, load a save. handlingException has one "
+                + "writer in the assembly and no clearer, and it survives a scene load, "
+                + "so loading a save into this process leaves it degraded.";
+            if (!Safe<bool>(delegate { return GameControl.handlingException; }, false))
+                o["note"] =
+                    "the exception was logged and handlingException did NOT latch, so "
+                    + "this process is not in the crash state and nothing has been "
+                    + "tested. Either Debug.unityLogger.logEnabled is false, or no "
+                    + "handler is subscribed to Application.logMessageReceived, or the "
+                    + "game build has moved.";
+            return o;
+        }
+
+        // Everything HandleException dereferences before the crash panel is up:
+        // GameTimeManager.Singleton for PauseAndBlock, GameControl.canvasStack and its
+        // OptionsScreen for ShowExceptionDialog, GameControl.eventManager for
+        // ClearAllEvents. A null in any of them throws inside the handler, and the
+        // handler's own catch quits the process. Returns the reason to refuse, or null
+        // when the handler can run.
+        //
+        // The serialized fields ShowExceptionDialog then touches on the controller
+        // itself (moddingText, crashExceptionText, crashPanel) are not checkable from
+        // here, so a quit remains possible even past this. That is why the tool
+        // documents both outcomes.
+        static string CrashHandlerBlocker()
+        {
+            if (Safe<bool>(delegate { return GameTimeManager.Singleton == null; }, true))
+                return "there is no GameTimeManager";
+            if (Safe<bool>(delegate { return GameControl.canvasStack == null; }, true))
+                return "there is no canvas stack";
+            if (Safe<bool>(
+                    delegate {
+                        return !(GameControl.canvasStack.OptionsScreen
+                                 is OptionsScreenController);
+                    }, true))
+                return "the options screen is not an OptionsScreenController, so there "
+                     + "is no crash panel to show";
+            if (Safe<bool>(delegate { return GameControl.eventManager == null; }, true))
+                return "there is no event manager";
+            return null;
         }
 
         // The dispatch table itself, so a client can detect verb drift against the
@@ -282,7 +524,70 @@ namespace TerraInvictaMCP
             o["blocked"] = Blocked(manager);
             o["armed"] = runUntilTarget != null;
             o["run_until"] = runUntilText;
+            // On the same reply as `blocked`, because a caller polling a frozen clock
+            // has to be able to tell a modal decision from a dead game without a second
+            // round trip. See Crashed.
+            o["crashed"] = Crashed();
+            // Here rather than on a verb of its own: a driver reads this reply
+            // before every re-arm, and a second round trip would leave a window
+            // between the reading and the arm.
+            o["missionPhase"] = MissionPhase();
+            // The envelope carries the seconds already; this is the diagnosis
+            // that goes with them -- how long since anything called, and which
+            // of the four ways the clock can be still this one is.
+            o["stall"] = StallBlock(manager);
             return o;
+        }
+
+        // The mission-phase machinery, read exactly the way
+        // AiControl.MissionPhaseBusy reads it: the global phase flag, plus the
+        // two per-faction flags that mean a phase is about to start or is still
+        // winding down. Both faction flags are fsIgnore, so polling them is
+        // load-safe. `collisions` is the engine's own "already active" branch,
+        // counted by the StartNewMissionPhase prefix.
+        static JToken MissionPhase()
+        {
+            bool active = false;
+            bool prepping = false;
+            bool planning = false;
+            try
+            {
+                TIMissionPhaseState phase = GameStateManager.MissionPhase();
+                active = phase != null && phase.phaseActive;
+                TIFactionState[] factions = GameStateManager.AllFactions();
+                if (factions != null)
+                {
+                    for (int i = 0; i < factions.Length; i++)
+                    {
+                        TIFactionState f = factions[i];
+                        if (f == null) continue;
+                        if (f.preppingForMissions) prepping = true;
+                        if (f.planningMissions) planning = true;
+                    }
+                }
+            }
+            // A read that throws reports the phase as closed, which is what
+            // every caller did before this key existed. The error is recorded
+            // rather than swallowed.
+            catch (Exception e) { Server.LastError = Note(e); }
+            var o = new JObject();
+            o["active"] = active;
+            o["prepping"] = prepping;
+            o["planning"] = planning;
+            o["collisions"] = AiControl.MissionPhaseCollisions;
+            return o;
+        }
+
+        // True when the block above says a phase is open. Prepping and planning
+        // are reported but do not refuse an arm: they are set for whole
+        // stretches of an ordinary tick and refusing on them would stop every
+        // run, while only phaseActive names the branch that corrupts.
+        static bool PhaseIsActive(JToken phase)
+        {
+            var o = phase as JObject;
+            if (o == null) return false;
+            JToken t = o["active"];
+            return t != null && t.Type == JTokenType.Boolean && (bool)t;
         }
 
         static JToken Blocked(GameTimeManager manager)
@@ -457,10 +762,10 @@ namespace TerraInvictaMCP
                 o["value"] = scalar;
                 return o;
             }
-            JToken list = ListValue(current, current.GetType());
-            if (list != null)
+            JToken collection = Collection(current, current.GetType(), o);
+            if (collection != null)
             {
-                o["value"] = list;
+                o["value"] = collection;
                 return o;
             }
             o["members"] = Members(current, includePrivate);
@@ -885,18 +1190,62 @@ namespace TerraInvictaMCP
                     return Num(Convert.ToDouble(v, CultureInfo.InvariantCulture));
             }
 
-            JToken list = ListValue(v, t);
+            JToken list = ListValue(v, t, null);
             if (list != null) return list;
             return new JValue(t.Name);
         }
 
+        // The endpoint's renderer, and only the endpoint's: a list or a dictionary,
+        // whichever the walk landed on.
+        //
+        // Value() above deliberately does NOT call this. A member dump is depth 1 over
+        // every member at once, and dictionaries are not one member's worth of cost the
+        // way a list is. TIFactionState alone declares 46 of them, 36 with both type
+        // arguments Expandable -- 12 public and 24 more under include_private. At the
+        // 200 cap that is thousands of pairs in a single dump, and one field settles it
+        // on its own: cachedTechTooltipStrings is Dictionary<TIGenericTechTemplate,
+        // string> holding prebuilt tooltip text, so 200 of its values approach the
+        // server's whole 160000-character response budget by themselves. Game-state
+        // keys make it worse than a size problem: intel and highestIntel are keyed by
+        // TIGameState, so rendering both costs up to 400 GetDisplayName calls on the
+        // main thread for a dump nobody asked a dictionary question of.
+        //
+        // So a dictionary expands when the caller walks onto it -- `path=objectives` --
+        // and stays a bare type name in a member dump, exactly as a nested list does.
+        // The cost is then one dictionary per call, which the 200 cap bounds by pair
+        // count and MaxDictChars bounds by size.
+        static JToken Collection(object v, Type t, JObject report)
+        {
+            JToken list = ListValue(v, t, report);
+            if (list != null) return list;
+            return DictValue(v, t, report);
+        }
+
+        // What was rendered against what was there. The caps below bound the work, and
+        // an answer cut at a cap is indistinguishable from a complete one unless the
+        // response says so: `inspect id=<faction> path=intel` answering 200 pairs makes
+        // "key K is absent" an undetectable false negative past the cap.
+        // mission.evaluate reports attackingModifiersTotal beside its capped list for
+        // the same reason. Only the endpoint gets these -- a member dump renders no
+        // dictionary at all and cuts its lists at the same 200 as it always has.
+        static void ReportCut(JObject report, int count, int shown, string cutBy)
+        {
+            if (report == null) return;
+            report["valueCount"] = count >= 0
+                ? (JToken)new JValue(count) : JValue.CreateNull();
+            report["valueShown"] = shown;
+            report["valueTruncated"] = cutBy != null;
+            report["valueTruncatedBy"] = cutBy != null
+                ? (JToken)new JValue(cutBy) : JValue.CreateNull();
+        }
+
         // Lists and single-dimension arrays expand when their declared element type is
         // something depth 1 can render: a game state, a template, a string, an enum, or
-        // a number or bool. A dictionary, a nested list, or a collection of arbitrary
-        // objects stays a type name, which is what keeps one member from dragging in
-        // the rest of the graph. Over-long lists are cut at the cap without a marker,
-        // as this has always done.
-        static JToken ListValue(object v, Type t)
+        // a number or bool. A nested list, or a collection of arbitrary objects, stays
+        // a type name. An over-long list is cut at the cap: at the endpoint the cut is
+        // reported through ReportCut, and inside a member dump it stays silent, as it
+        // has always been.
+        static JToken ListValue(object v, Type t, JObject report)
         {
             Type element = null;
             if (t.IsArray && t.GetArrayRank() == 1) element = t.GetElementType();
@@ -908,12 +1257,18 @@ namespace TerraInvictaMCP
             if (items == null) return null;
             var a = new JArray();
             int n = 0;
+            bool cut = false;
             foreach (object item in items)
             {
-                if (n >= MaxRefListLength) break;
+                if (n >= MaxRefListLength) { cut = true; break; }
                 n++;
                 a.Add(Element(item));
             }
+            // Every type this expands is a List<T> or a single-dimension array, so the
+            // collection's own count is one property read rather than a second walk.
+            var sized = v as System.Collections.ICollection;
+            ReportCut(report, sized != null ? sized.Count : -1, n,
+                cut ? "entries" : null);
             return a;
         }
 
@@ -959,6 +1314,128 @@ namespace TerraInvictaMCP
                     new JValue("<error: dataName>"));
             }
             return Value(item);
+        }
+
+        // A Dictionary<K,V> expands when BOTH declared type arguments pass the same
+        // Expandable test a list's element type passes, and it is cut at the same cap.
+        // Each side goes through Element, so a template key or value collapses to its
+        // data name exactly as it does inside an expanded list. The test is on the
+        // RUNTIME type, so a member declared IDictionary<K,V> expands when what it
+        // actually holds is a Dictionary<K,V>. Anything else stays a bare type name:
+        // a dictionary of arbitrary objects, and any other map type, since
+        // SortedDictionary is not worth widening the test for until the engine uses
+        // one somewhere this verb has to read.
+        //
+        // Two distinct keys can render to the same text: two templates sharing a data
+        // name is the case that actually occurs, and JSON object members are unique, so
+        // one entry would vanish silently. The object shape is therefore used only when
+        // every rendered key is distinct. Otherwise the answer is an array of
+        // {key, value} pairs with each colliding pair flagged, which keeps the
+        // collision visible instead of eating an entry -- the same choice Element makes
+        // when it reports a throwing dataName rather than a null.
+        // The character budget the 200-entry cap cannot supply. That cap bounds the
+        // number of pairs and says nothing about the size of one:
+        // cachedTechTooltipStrings is a PUBLIC Dictionary<TIGenericTechTemplate, string>
+        // of prebuilt tooltip text, so `path=cachedTechTooltipStrings` needs no
+        // include_private and its first 200 values approach the server's whole 160000-
+        // character response budget by themselves. query.template refuses outright over
+        // its own MaxTemplateChars; this one cuts instead, because valueCount and
+        // valueTruncatedBy travel with the answer and say what was left out.
+        const int MaxDictChars = 64 * 1024;
+
+        static JToken DictValue(object v, Type t, JObject report)
+        {
+            if (!t.IsGenericType || t.GetGenericTypeDefinition() != typeof(Dictionary<,>))
+                return null;
+            Type[] sides = t.GetGenericArguments();
+            if (!Expandable(sides[0]) || !Expandable(sides[1])) return null;
+            var dict = v as System.Collections.IDictionary;
+            if (dict == null) return null;
+
+            var keys = new List<string>();
+            var values = new List<JToken>();
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            int chars = 0;
+            string cutBy = null;
+            System.Collections.IDictionaryEnumerator walk = dict.GetEnumerator();
+            while (walk.MoveNext())
+            {
+                if (keys.Count >= MaxRefListLength) { cutBy = "entries"; break; }
+                string key = KeyText(walk.Key);
+                JToken value = Element(walk.Value);
+                // Measured before it is kept, so the budget bounds what the response
+                // carries. Testing the running total first let one entry of any size
+                // through: a single prebuilt tooltip string is the case that matters,
+                // and it is exactly the one this cap exists for.
+                int size = key.Length + Safe<int>(
+                    delegate { return value.ToString(Formatting.None).Length; }, 0);
+                if (chars + size > MaxDictChars && keys.Count > 0)
+                {
+                    cutBy = "characters";
+                    break;
+                }
+                chars += size;
+                int seen;
+                counts[key] = counts.TryGetValue(key, out seen) ? seen + 1 : 1;
+                keys.Add(key);
+                values.Add(value);
+            }
+            ReportCut(report, dict.Count, keys.Count, cutBy);
+
+            // Which shape this came back as. The uniqueness test can only see the
+            // entries the walk reached, and dictionary enumeration order is not stable
+            // across mutations, so the same path can answer an object on one call and an
+            // array of pairs on the next. A client reading `value` by key needs to be
+            // told which it got rather than inferring it from the JSON type.
+            bool unique = counts.Count == keys.Count;
+            if (report != null)
+                report["valueShape"] = unique ? "object" : "pairs";
+            if (unique)
+            {
+                var o = new JObject();
+                for (int i = 0; i < keys.Count; i++) o[keys[i]] = values[i];
+                return o;
+            }
+            var pairs = new JArray();
+            for (int i = 0; i < keys.Count; i++)
+            {
+                var pair = new JObject();
+                pair["key"] = keys[i];
+                pair["value"] = values[i];
+                if (counts[keys[i]] > 1) pair["duplicateKey"] = true;
+                pairs.Add(pair);
+            }
+            return pairs;
+        }
+
+        // The key's own text, which is what a JSON object member name has to be. Every
+        // Expandable key type already renders to one through Element -- a template to
+        // its data name, a string to itself, an enum to its member name, a number to
+        // its digits -- except a game state, which Element describes as an object; that
+        // one takes the "name (id)" form the refusals across this mod already use, so a
+        // key is always a name rather than a nested JSON blob. Numbers are converted
+        // under the invariant culture, since JValue.ToString() would pick up the
+        // current one and hand back a decimal comma on some machines.
+        static string KeyText(object key)
+        {
+            if (key == null) return "null";
+            var state = key as TIGameState;
+            if (state != null)
+            {
+                return Safe<string>(delegate
+                {
+                    string name = StateName(state);
+                    return (string.IsNullOrEmpty(name) ? state.GetType().Name : name)
+                        + " (" + (int)state.ID + ")";
+                }, "<error: key>");
+            }
+            JToken token = Element(key);
+            var scalar = token as JValue;
+            if (scalar == null) return token.ToString(Formatting.None);
+            if (scalar.Value == null) return "null";
+            return Safe<string>(
+                delegate { return Convert.ToString(scalar.Value, CultureInfo.InvariantCulture); },
+                scalar.Value.ToString());
         }
 
         // NaN and the infinities are not JSON numbers; they ride as strings so a client
@@ -1063,14 +1540,47 @@ namespace TerraInvictaMCP
                 throw new VerbError("arg 'date' must be yyyy-MM-dd");
             }
             var target = new TIDateTime(parsed.Year, parsed.Month, parsed.Day);
+            string normalized = InvariantDate(target);
+            JToken phase = MissionPhase();
+
+            // Idempotent. A driver that re-states the target it already has is
+            // asking for nothing, and doing the work anyway cleared
+            // clockParkedByDriver -- so a park the wire had just been given was
+            // un-parked by the next poll that re-armed. Nothing is touched here,
+            // the park included.
+            if (runUntilTarget != null && runUntilText == normalized)
+            {
+                var same = new JObject();
+                same["armed"] = true;
+                same["alreadyArmed"] = true;
+                same["target"] = runUntilText;
+                same["missionPhase"] = phase;
+                return same;
+            }
+
+            // A NEW target while a mission phase is open is refused. Arming is a
+            // statement of intent to run: it clears the park and the clock goes
+            // back to full speed, and a semimonthly tick landing inside an open
+            // phase is what corrupts it -- the engine's own guard clears
+            // phaseActive and leaves factionsSignallingComplete populated, and
+            // the stale list ends the next phase early. Close the phase first
+            // (prompts.dismiss presses the assignment confirmation), or say
+            // force=true and own the outcome.
+            if (PhaseIsActive(phase) && !Flag(args, "force"))
+                throw new VerbError("mission_phase: a mission phase is open "
+                    + "(missionPhase " + phase.ToString(Formatting.None) + "), and arming a "
+                    + "new run_until target hands the clock back into it. Close the phase "
+                    + "first -- prompts.dismiss presses the mission-assignment confirmation "
+                    + "-- or pass force=true to arm anyway");
+
             runUntilTarget = target;
-            runUntilText = InvariantDate(target);
-            // Arming is a statement of intent to run; a stale park must not
-            // leave the engaged tick refusing to resume.
+            runUntilText = normalized;
             clockParkedByDriver = false;
             var o = new JObject();
             o["armed"] = true;
+            o["alreadyArmed"] = false;
             o["target"] = runUntilText;
+            o["missionPhase"] = phase;
             return o;
         }
 
@@ -1078,12 +1588,418 @@ namespace TerraInvictaMCP
         // not stop the other from being serviced.
         public static void Tick()
         {
+            try { TickClockWatch(); }
+            catch (Exception e) { Server.LastError = Note(e); }
             try { TickRunUntil(); }
             catch (Exception e) { Server.LastError = Note(e); }
             TickAutoresolve();
             // An engagement must not survive the campaign it was made in.
             try { AiControl.Tick(); }
             catch (Exception e) { Server.LastError = Note(e); }
+        }
+
+        // ------------------------------------------------------- clock watchdog
+        //
+        // Game time not advancing while a campaign is loaded is the failure a
+        // driving agent misses: nothing throws, every verb answers, and a whole
+        // test hour passes with the game paused behind a prompt, parked at a
+        // target nobody re-armed, or waiting on fixtures being built one call at
+        // a time. The server cannot measure it, because it only sees the calls
+        // it makes and the stall is exactly the stretch where it is making none.
+        // So the measurement is here, against real time rather than game time.
+        //
+        // Two conditions count. The clock not moving at all, and the clock
+        // crawling -- speed index below 3 with no run_until armed, where the
+        // date changes every frame while an hour of real time buys a day or two
+        // of game time. The second is the first in slow motion and reads the
+        // same from outside.
+        //
+        // Cost per frame is five engine reads -- the campaign check, the time
+        // manager, its date, its speed index and realtimeSinceStartup -- the
+        // six multiplies that pack the date into one long, and two compares.
+        // Nothing walks the campaign, and the one allocation is the date:
+        // manager.currentTime is TITimeState.Time_Now(), which copy-constructs
+        // a TIDateTime on every call. That is one small short-lived object a
+        // frame, alongside the many the engine's own per-frame callers of the
+        // same property already make. The field behind it, currentDateTime,
+        // would cost nothing to read, but it is private, so reading it means
+        // reflection against a name no compiler checks -- and a rename in a
+        // game patch would park the watchdog silently, which is a worse
+        // failure than a Gen0 object.
+        //
+        // Delegates are what this path does keep out: the whole sample is one
+        // try/catch with no lambda in it, because Safe<T> takes a Func and a
+        // lambda that reads a local builds a display class and a delegate
+        // every time it runs. Once a frame for the life of a session is not a
+        // cost this path may carry. The state name and the blocking prompt use
+        // Safe and are computed when something asks.
+
+        // The sampled game date, packed into one comparable value. currentTime
+        // hands back a fresh object, so the comparison has to be by value.
+        static long clockKey;
+        static bool clockKeyKnown;
+        // Real seconds, from Unity's realtimeSinceStartup: it keeps running
+        // while the game clock is stopped, which is the whole point. `movedAt`
+        // is the last change of any size; `healthyAt` is the last change that
+        // was not a crawl, and the stall is measured from it.
+        static float clockMovedAt;
+        static float clockHealthyAt;
+        // Computed by the tick and read by the envelope, so building a response
+        // never calls a Unity API.
+        static float clockStallSeconds;
+        static bool clockStallKnown;
+        static bool clockCrawling;
+        static bool hadCampaign;
+        // Which faction held the active-player seat when this campaign came up,
+        // and whether anything has been latched yet.
+        //
+        // The engine's own isAI flag cannot answer "has the seat been moved".
+        // GameControl.SetActivePlayer -- the only engine caller of
+        // TIPlayerState.AssignAIStatus, and what the console's setfaction goes
+        // through -- walks every player state and writes
+        // isAI = (control.activePlayer != player.faction). So whichever faction
+        // has just been given the seat always reads isAI false, moved or not,
+        // and the faction that just lost it reads true. The identity of the
+        // seated faction is the only thing that changes, so that is what is
+        // latched and compared.
+        static TIFactionState seatedFaction;
+        static bool seatLatched;
+        // Set by ForgetSeat and cleared by one place only: the no-campaign branch
+        // of TickClockWatch. It holds the latch open across the frames between a
+        // verb discarding the gamestate and the engine finishing the job. See
+        // ForgetSeat for why those frames exist.
+        static bool seatTeardown;
+        static float lastVerbAt;
+        static bool lastVerbKnown;
+        static float lastRealTime;
+        // Whole five-minute marks of the CURRENT stall already logged; reset
+        // when the clock recovers, so each stall gets its own lines.
+        static int stallWarnMarks;
+
+        const float StallWarnEverySeconds = 300f;
+        // A frame or two without a date change is not a stopped clock: the
+        // engine advances time from its own update, which can miss a frame.
+        const float MovingWindowSeconds = 1f;
+        // Below this speed index, with nothing armed, the clock is crawling.
+        const int CrawlSpeedIndex = 3;
+
+        // Guarded because a tick must never throw. A failed read reports the
+        // last value rather than jumping the measurement to zero.
+        static float RealTime()
+        {
+            try { lastRealTime = Time.realtimeSinceStartup; }
+            catch (Exception) { }
+            return lastRealTime;
+        }
+
+        // Not a timestamp: one value that changes whenever any field of the
+        // game date does, so "has the clock moved" is a single comparison and
+        // no allocation. Each multiplier is one past its field's range.
+        static long ClockKey(TIDateTime t)
+        {
+            long k = t.year;
+            k = k * 13 + t.month;
+            k = k * 32 + t.day;
+            k = k * 25 + t.hour;
+            k = k * 61 + t.minute;
+            k = k * 61 + t.second;
+            return k * 1000 + t.millisecond;
+        }
+
+        // Record whoever holds the seat right now. Guarded, and a read that
+        // fails or finds no faction leaves the latch open for the next tick:
+        // a wrong latch is worse than a late one, since everything downstream
+        // compares against it. Refuses outright while a teardown is pending,
+        // which is the same rule for the same reason.
+        static void LatchSeat()
+        {
+            if (seatTeardown) return;
+            TIFactionState seat = null;
+            try
+            {
+                GameControl control = GameControl.control;
+                if (control != null) seat = control.activePlayer;
+            }
+            catch (Exception) { return; }
+            if (seat == null) return;
+            seatedFaction = seat;
+            seatLatched = true;
+        }
+
+        // Called by the verbs that replace or discard the gamestate. The next
+        // tick with a campaign present latches whatever faction the new one
+        // seated, so a load or a new campaign is never read as a moved seat.
+        //
+        // `seatTeardown` is what makes "the next tick" mean the next tick of the
+        // NEXT campaign. saves.load and game.main_menu start a teardown that runs
+        // as a coroutine: ViewControl.CleanupData yields once before it reaches
+        // ClearAllGameStates and ResetLoadingState, so HasCampaign still answers
+        // true for a frame or more after the verb returns. Main.OnUpdate runs
+        // Server.Drain() and then Verbs.Tick() in the same frame, so the tick that
+        // follows the verb would find a campaign present with nothing latched and
+        // re-latch the OUTGOING campaign's faction, undoing the call that just
+        // cleared it. The flag holds the latch shut until TickClockWatch sees no
+        // campaign, which is the engine reporting the teardown finished, and that
+        // branch is the only place it clears.
+        //
+        // campaign.new needs none of this and is not harmed by it: it refuses
+        // unless HasCampaign is already false, so the first tick after it clears
+        // the flag and the latch is open again well before the new gamestate
+        // exists. It calls this anyway, since nothing latched from an earlier
+        // campaign may survive into the new one.
+        internal static void ForgetSeat()
+        {
+            seatedFaction = null;
+            seatLatched = false;
+            seatTeardown = true;
+        }
+
+        // The faction latched at campaign start, for a reply that wants to name
+        // the seat a caller should put back. Null when nothing is latched.
+        internal static TIFactionState SeatedFaction
+        {
+            get { return seatLatched ? seatedFaction : null; }
+        }
+
+        // True when the active-player seat is held by a faction other than the
+        // one this campaign came up with. That is what a console `setfaction`
+        // does, and it is the state the human UI's answer handlers cannot
+        // survive.
+        //
+        // An engagement is not a moved seat. AiControl.Engage flips isAI on the
+        // faction ALREADY seated and never calls SetActivePlayer, so the
+        // comparison below would answer false on its own; the explicit skip is
+        // here so a later change to the engagement cannot turn it into a
+        // refusal of the one pass an unattended run depends on.
+        //
+        // Every failure answers false. This gates prompts.dismiss, which the
+        // unattended loop calls every poll, and a guard that refused on a read
+        // it could not make would take that loop out on the first build that
+        // moves a field.
+        internal static bool ActivePlayerSeatMoved()
+        {
+            if (AiControl.Engaged) return false;
+            if (!seatLatched || seatedFaction == null) return false;
+            TIFactionState seat = null;
+            try
+            {
+                GameControl control = GameControl.control;
+                if (control != null) seat = control.activePlayer;
+            }
+            catch (Exception) { return false; }
+            if (seat == null) return false;
+            // Reference identity on purpose. TIGameState overloads == to compare
+            // GameStateIDs, and ids are reused across campaigns, so an id match
+            // across a gamestate swap would read as an unmoved seat. Within one
+            // campaign there is one instance per faction, so the two agree.
+            return !ReferenceEquals(seat, seatedFaction);
+        }
+
+        static void TickClockWatch()
+        {
+            float now = RealTime();
+            // Every engine read of the frame, in one try/catch with no lambda
+            // in it. IsCrawl went through Safe<bool>, so this path used to
+            // build a closure a frame to read one property. A read that throws
+            // leaves `campaign` false and `manager` null, which parks the
+            // watchdog for this frame rather than reporting a stall it did not
+            // measure.
+            bool campaign = false;
+            GameTimeManager manager = null;
+            TIDateTime cur = null;
+            bool crawl = false;
+            try
+            {
+                // The property itself, not a copy of its body: it has its own
+                // try/catch, allocates nothing, and a second statement of the
+                // same two reads would drift from it.
+                campaign = HasCampaign;
+                if (campaign)
+                {
+                    manager = GameTimeManager.Singleton;
+                    if (manager != null)
+                    {
+                        cur = manager.currentTime;
+                        // Speed 1 and 2 with nothing armed. An armed run_until
+                        // is a driver asking for a bounded slow run and says
+                        // when it ends, so it is not a crawl however slow.
+                        crawl = runUntilTarget == null
+                            && manager.currentSpeedIndex < CrawlSpeedIndex;
+                    }
+                }
+            }
+            catch (Exception) { return; }
+            if (!campaign)
+            {
+                // Nothing to measure between campaigns.
+                hadCampaign = false;
+                clockKeyKnown = false;
+                clockStallKnown = false;
+                clockStallSeconds = 0f;
+                clockCrawling = false;
+                stallWarnMarks = 0;
+                // The seat belonged to the campaign that is gone. This is also
+                // the one place a pending teardown clears, so it is cleared
+                // after the call: ForgetSeat sets the flag.
+                ForgetSeat();
+                seatTeardown = false;
+                return;
+            }
+            // A campaign is present and nothing holds the seat yet: either this
+            // is its first frame, or a verb that replaces the gamestate cleared
+            // the latch. Ahead of the time-manager test below, because the seat
+            // is set before the clock is up and a campaign whose manager is not
+            // ready yet would otherwise go unlatched.
+            //
+            // The second case is why LatchSeat refuses while a teardown is
+            // pending: the campaign a load or a return to the menu is discarding
+            // is still present on the frames right after the verb runs, and this
+            // line would re-latch it.
+            if (!seatLatched) LatchSeat();
+            if (manager == null || cur == null) return;
+            long key = ClockKey(cur);
+            if (!hadCampaign)
+            {
+                // First frame of a campaign. The timer restarts here, or a save
+                // reloaded to the date it was saved at would inherit the stall
+                // of the campaign it replaced.
+                hadCampaign = true;
+                clockKeyKnown = false;
+                stallWarnMarks = 0;
+                clockMovedAt = now;
+                clockHealthyAt = now;
+            }
+            if (!clockKeyKnown)
+            {
+                clockKey = key;
+                clockKeyKnown = true;
+            }
+            else if (key != clockKey)
+            {
+                clockKey = key;
+                clockMovedAt = now;
+                // A crawl is movement, so it keeps `movedAt` fresh and the state
+                // reads `running`; it does not clear the stall.
+                if (!crawl)
+                {
+                    clockHealthyAt = now;
+                    stallWarnMarks = 0;
+                }
+            }
+            clockCrawling = ClockIsMoving(now) && crawl;
+            clockStallSeconds = now - clockHealthyAt;
+            clockStallKnown = true;
+            int marks = (int)(clockStallSeconds / StallWarnEverySeconds);
+            if (marks <= stallWarnMarks) return;
+            stallWarnMarks = marks;
+            // Only once something has driven this session through the bridge.
+            // The mod ships to players, and a player who pauses for five
+            // minutes with it installed has done nothing wrong; the line is
+            // about a harness whose clock stopped. The marks advance either
+            // way, so a client that connects mid-stall gets the next one.
+            if (!lastVerbKnown) return;
+            // One line per whole five minutes, through the UMM logger, which
+            // adds the [TerraInvictaMCP] prefix and writes to Player.log
+            // (log_tail which=player). The four values are the diagnosis: no
+            // verbs for twenty minutes means the agent is thinking or dead,
+            // verbs every few seconds over a stopped clock means an agent loop,
+            // and a named prompt means a decision nobody is taking.
+            try
+            {
+                string prompt = BlockingPromptName();
+                Main.Log.Log("clock stalled " + (int)clockStallSeconds
+                    + " s, state=" + ClockStateName(manager, now)
+                    + ", prompt=" + (string.IsNullOrEmpty(prompt) ? "none" : prompt)
+                    + ", last verb " + SinceLastVerbText() + " s ago");
+            }
+            catch (Exception e) { Server.LastError = Note(e); }
+        }
+
+        static bool ClockIsMoving(float now)
+        {
+            return clockKeyKnown && now - clockMovedAt < MovingWindowSeconds;
+        }
+
+        // Named from observed movement plus the manager's own flags. `combat`
+        // is the SpaceCombat view, where the strategic clock is skipped while
+        // paused and blocked both read normal; `stopped` is a clock that is not
+        // moving with none of the flags set to explain it.
+        static string ClockStateName(GameTimeManager manager, float now)
+        {
+            if (ClockIsMoving(now)) return "running";
+            if (Safe<bool>(delegate { return manager.Paused; }, false)) return "paused";
+            if (Safe<bool>(delegate { return manager.IsBlocked; }, false)) return "blocked";
+            if (InSpaceCombatView()) return "combat";
+            return "stopped";
+        }
+
+        static bool InSpaceCombatView()
+        {
+            return Safe<bool>(delegate
+            {
+                GameControl control = GameControl.control;
+                if (control == null) return false;
+                ViewControl views = control.viewMgr;
+                return views != null && views.currentView == ViewType.SpaceCombat;
+            }, false);
+        }
+
+        // The first prompt holding the active player's clock, for the log line.
+        // Same two lists TIPromptQueueState.anyActivePlayerBlocking counts.
+        static string BlockingPromptName()
+        {
+            try
+            {
+                TIPromptQueueState queue = GameStateManager.PromptQueue();
+                if (queue == null) return null;
+                string name = FirstPromptName(queue.activePlayerFactionPromptList);
+                if (name != null) return name;
+                return FirstPromptName(queue.activePlayerNationPromptList);
+            }
+            catch (Exception) { return null; }
+        }
+
+        static string FirstPromptName(List<Prompt> list)
+        {
+            if (list == null) return null;
+            for (int i = 0; i < list.Count; i++)
+            {
+                // Prompt is a struct, so there is no null entry to skip.
+                Prompt prompt = list[i];
+                string name = Safe<string>(delegate { return prompt.name; }, null);
+                if (!string.IsNullOrEmpty(name)) return name;
+            }
+            return null;
+        }
+
+        static string SinceLastVerbText()
+        {
+            if (!lastVerbKnown) return "?";
+            return ((int)(RealTime() - lastVerbAt)).ToString(CultureInfo.InvariantCulture);
+        }
+
+        // Seconds of stall, or null when there is nothing to measure: no
+        // campaign, or no tick yet since one loaded.
+        static JToken Stall()
+        {
+            if (!clockStallKnown) return JValue.CreateNull();
+            return new JValue(Math.Round((double)clockStallSeconds, 1));
+        }
+
+        // {seconds, sinceLastVerbSeconds, state, crawl} for query.time.
+        static JToken StallBlock(GameTimeManager manager)
+        {
+            float now = RealTime();
+            var o = new JObject();
+            o["seconds"] = Stall();
+            o["sinceLastVerbSeconds"] = lastVerbKnown
+                ? (JToken)new JValue(Math.Round((double)(now - lastVerbAt), 1))
+                : JValue.CreateNull();
+            o["state"] = clockStallKnown
+                ? (JToken)new JValue(ClockStateName(manager, now))
+                : JValue.CreateNull();
+            o["crawl"] = clockCrawling;
+            return o;
         }
 
         // Disarms before pausing so a failed Pause cannot leave a target that fires forever.
@@ -1173,6 +2089,15 @@ namespace TerraInvictaMCP
             Disarm();
             autoError = null;
             autoNote = null;
+            // Same reason: the collision count describes the campaign being
+            // replaced, and query.time would otherwise report it against the
+            // incoming one.
+            AiControl.ResetMissionPhaseCollisions();
+            // And the seat: the save names its own active player, which need not
+            // be the faction seated in the campaign this replaces. Cleared here
+            // rather than re-read, because the load is asynchronous and the seat
+            // is not the new one yet; the tick latches it once the campaign is up.
+            ForgetSeat();
             menu.LoadSaveFilePath(path);
 
             var o = new JObject();
@@ -1366,9 +2291,31 @@ namespace TerraInvictaMCP
             return state;
         }
 
+        // A state id that has to be one particular class. ById would answer "no
+        // TICouncilorState with id 42" for an id that resolves perfectly well to
+        // something else, which sends the caller looking for a missing state
+        // rather than at the wrong argument.
         static T Arg<T>(JObject args, string key) where T : TIGameState
         {
-            return ById<T>(Int(args, key));
+            int id = Int(args, key);
+            // The typed lookup first, which is the one ById uses: two dictionary probes
+            // against the type bucket, then a probe per bucket whose key is assignable
+            // to T. The non-generic FindGameState below enumerates every bucket and
+            // compares every id in it one at a time, so it charges the size of the
+            // campaign to every call -- mission.evaluate makes two per request and
+            // ui.describe up to three, on the main thread with the game frozen.
+            //
+            // The scan is kept for the miss, where it is the only way to say WHICH kind
+            // the id resolved to. A miss is already the error path, so the campaign-size
+            // walk is paid only by a call that is about to be refused.
+            T typed = GameStateManager.FindGameState<T>(new GameStateID(id), true);
+            if (typed != null) return typed;
+            TIGameState state = GameStateManager.FindGameState(new GameStateID(id));
+            if (state == null)
+                throw new VerbError("arg '" + key + "': no game state with id " + id);
+            throw new VerbError("arg '" + key + "': id " + id + " is a "
+                + state.GetType().Name + " (" + StateName(state) + "), not a "
+                + typeof(T).Name);
         }
 
         // Inactive objects included: several controllers live on disabled canvases.

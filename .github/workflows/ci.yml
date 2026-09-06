@@ -51,10 +51,35 @@ jobs:
           print("\n".join(stray) or "only ModInfo.json")
           sys.exit(1 if stray else 0)
 
+      - name: no unicode dashes
+        shell: python
+        run: |
+          # House style is ASCII - and -- everywhere, including code comments
+          # and doc text. The rule lived only as prose, and prose does not fail
+          # a build. Em dash, en dash, horizontal bar, minus sign, the two
+          # quotation dashes.
+          import os, sys
+          BAD = "\u2012\u2013\u2014\u2015\u2212\u2010\u2011"
+          EXT = (".py", ".cs", ".md", ".sh", ".ps1", ".yml", ".json", ".txt")
+          hits = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d != ".git"]
+              for name in files:
+                  if not name.endswith(EXT):
+                      continue
+                  path = os.path.join(root, name)
+                  with open(path, encoding="utf-8", errors="replace") as f:
+                      for num, line in enumerate(f, 1):
+                          for ch in BAD:
+                              if ch in line:
+                                  hits.append("%s:%d: U+%04X" % (path, num, ord(ch)))
+          print("\n".join(hits) or "no unicode dashes")
+          sys.exit(1 if hits else 0)
+
       - name: stdout hygiene
         run: python server/stdio_selfcheck.py
 
-      - name: modcheck unit tests
+      - name: unit tests
         run: python -m unittest discover -s server/tests
 
       - name: shell scripts parse

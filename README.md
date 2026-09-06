@@ -173,8 +173,8 @@ The full guide, with examples and how to read the results:
 ## What the agent can do in a live game
 
 - **Set up any situation.** Spawn habs, modules, fleets, armies, councilors
-  and alien sites, or destroy them, and force a nation's cohesion,
-  democracy, inequality or education to a test value. These are fixtures:
+  and alien sites, or destroy them, design a ship class from named parts, and
+  force a nation's cohesion, democracy, inequality or education to a test value. These are fixtures:
   they skip cost and prerequisites to prove a mechanism fires. A spawned
   module still carries its real build cost, so anything downstream that
   reads the price reads the right one.
@@ -312,28 +312,49 @@ A map of what the bridge answers, for orientation:
   what version is it, and what verbs does it serve. These answer with no
   campaign loaded, so a client can feature-detect before doing anything.
 - **Read-only queries** (`query.*`, `mods.list`, `harmony.patches`,
-  `assets.*`, `ui.tooltip`) -- game state, templates, enums, localization,
-  scenarios, both mod loaders' records, and tooltip text, all as JSON.
-  Nothing in this family changes the game.
+  `assets.*`, `ui.tooltip`, `ui.describe`) -- game state, templates, enums,
+  localization, scenarios, both mod loaders' records, and the text the
+  player reads: a nation-panel tooltip, or the long-form block behind a hab
+  module or a project. All as JSON. Nothing in this family changes the game.
 - **Time control** (`time.*`) -- pause, resume, set speed, and arm an
   auto-pause at a date for unattended runs.
-- **Saves and campaign entry** (`saves.*`, `campaign.new`) -- list, write and
-  load saves, and start a new campaign through the start screen's own
-  controls.
+- **Saves and campaign entry** (`saves.*`, `campaign.new`,
+  `game.main_menu`) -- list, write and load saves, start a new campaign
+  through the start screen's own controls, and put a loaded campaign back at
+  the start screen without restarting the game.
 - **Prompts and alerts** (`prompts.*`, `alert.choose`) -- read what is
   freezing the clock, answer or clear it, or press a specific option button
   on the open alert.
-- **Combat** (`combat.*`) -- start a fight, watch its status, and resolve it
-  headless the way the precombat screen's own buttons would.
-- **Fixtures** (`spawn.*`, `kill.module`, `nation.set_stat`) -- put habs,
-  modules, fleets, armies, councilors and alien sites in place, take a
-  module out, or force a nation stat, skipping cost and prerequisites. A
-  fixture proves a mechanism fires. It never proves a player could reach it.
+- **Combat** (`combat.*`) -- start a fight, watch its status, submit its stance,
+  and resolve it headless the way the precombat screen's own buttons would.
+- **Ship designs** (`design.create`, `design.delete`, `design.auto`) -- build a
+  ship design from named parts and validate it, let the engine design one, or
+  remove one. The ship designer is a mouse-driven screen, so this is the only
+  way to ask headlessly whether a part combination is buildable: a modded weapon
+  on a vanilla hull, a refit with one part swapped, a drive the faction has not
+  researched. `spawn.fleet` then builds ships from what was saved.
+- **Fixtures** (`spawn.*`, `kill.module`, `nation.set_stat`, `fleet.land`,
+  `fleet.transfer`) -- put habs, modules, fleets, armies, councilors and
+  alien sites in place, take a module out, force a nation stat, land a fleet
+  on a hab site, or give one a transfer it has not launched yet, skipping
+  cost and prerequisites. A fixture proves a mechanism fires. It
+  never proves a player could reach it.
 - **Gated play** (`nation.policies`, `nation.set_policy`,
-  `faction.diplomacy`, `fleet.bombard`, `module.power`) -- enumerate and
-  enact national policies, faction diplomacy, bombardment and module power
+  `faction.diplomacy`, `faction.relations`, `fleet.bombard`, `module.power`,
+  `hab.build_module`) -- enumerate and enact national policies, faction
+  diplomacy, faction hate, bombardment, module power and a hab module build
   through the engine's own rules, so a refusal names the condition that
-  failed.
+  failed. Faction hate is the one piece of campaign state nothing else
+  reaches: no console command sets one, so any AI reaction keyed off it had no
+  way to be staged. The
+  module build is the paying counterpart to the `spawn.module` fixture: it
+  charges the owner and makes the engine's own upgrade-versus-new-build
+  decision.
+- **Evaluation without execution** (`mission.evaluate`) -- a contested
+  councilor mission's success chance and outcome bands, taken from the
+  engine's own resolver out of the mission phase. It writes no campaign
+  state, and rolling outcomes is the one thing here that touches the
+  campaign at all: it advances the RNG stream unless a seed is given.
 - **The generic action layer** (`action.list`, `action.invoke`) -- the
   engine's whole player-action catalog by reflection, and a way to construct
   and submit any entry in it. Like the fixtures, it bypasses cost and
@@ -345,6 +366,10 @@ A map of what the bridge answers, for orientation:
   as their target.
 - **Screenshots** (`ui.screenshot`) -- capture the game from inside the
   process, so the image is the game even with the window buried.
+- **Screen and view control** (`ui.view`, `ui.screen`) -- switch between the
+  solar system and the political map, and open an info screen, the space
+  object detail panel or a rename panel, so a surface only a mouse used to
+  reach can be captured.
 
 This is orientation only. [docs/PROTOCOL.md](docs/PROTOCOL.md) is the
 contract: every verb, its arguments, and its gotchas.
