@@ -66,9 +66,31 @@ _RUN = {
     # guard rail is one: a crash that recurs on reload must not become a
     # restart loop.
     "crashRecoveries": 0,
+    # Whether one of those restarts actually completed. The counter alone does
+    # not say: it is spent when the attempt starts, and an attempt that dies
+    # at the stop or at the launch restarted nothing.
+    "crashRestarted": False,
     # The autopilot macro was switched on through this server and has not been
     # switched off. Only then is its engaged state worth polling.
     "macroOn": False,
+    # The campaign token last seen on an envelope. A different one means the
+    # campaign every other counter here describes is gone, whether or not a
+    # tool of this server's ordered the change.
+    "campaignToken": None,
+    # When the run entered the campaign it is playing, in the format the DLL
+    # reports save mtimes in. What makes "a save of this run" answerable.
+    "campaignAt": None,
+    # The save this run is playing, as {name, extension}, and the campaign
+    # token it belongs to. The token is None until the campaign the save was
+    # loaded into comes up, and is bound on the next change; a change after
+    # that is a campaign this save is no evidence about, and it is dropped.
+    "save": None,
+    "saveToken": None,
+    # A campaign entry this server ordered and has not seen arrive yet, so the
+    # next token change is that one rather than a campaign someone reached
+    # through the game's own screens, and the game process it was ordered in.
+    "campaignPending": False,
+    "entryProcess": None,
 }
 
 # Consecutive fruitless advance calls before the escalation changes. The
@@ -88,6 +110,14 @@ COMBAT_ARM_LIMIT = 2
 # Seconds to wait for the bridge to go quiet after a stop, before a restart is
 # called failed.
 BRIDGE_DOWN_WAIT = 20
+
+# Consecutive polls that go unanswered before a waiting loop gives up and
+# reports the bridge as lost. A single failed poll is a busy main thread and
+# is retried; five in a row is a socket nothing is going to answer. The loops
+# that count them never take an unanswered poll for a reading: silence says
+# nothing about what the game is doing, and acting on it as though it did is
+# how a live fight got its prompt dropped.
+LOST_POLLS_MAX = 5
 
 # Polls with an unreadable remaining-prompt count before the call stops. The
 # count is unreadable when the dismiss call raised, when the reply was not a
@@ -133,12 +163,33 @@ PAUSE_EXEMPT = frozenset((
     "combat_stance",
     "autopilot", "ai_autopilot", "game_stop", "game_start", "main_menu",
     "load_game", "campaign_new", "save_game", "crash_the_game",
-    "raw", "batch"))
+    # A write, but to this server's own session state rather than the game's,
+    # and it is how a run raises the limit it is being refused by.
+    "set_pause_limit"))
 
-# Exempt, but the banner goes on the answer: both are general-purpose passes
-# through to anything, so a caller using one over a stalled clock has to see
-# the stall the way a caller of the tool it stands in for would.
+# The two general-purpose passes through to any bridge verb. Over the limit
+# they are decided by what they carry rather than by their own names: a read
+# gets the banner, anything else is refused. Listing them as plain exempt was
+# a hole the width of the whole verb table -- every fixture, every console
+# line and every write the limit refuses under its own tool name goes through
+# either of these unchanged.
 PAUSE_BANNER_ANYWAY = frozenset(("raw", "batch"))
+
+# Bridge verbs that change nothing, for deciding a raw or batch call. Named
+# one by one rather than guessed from the verb name: `query.` and `assets.`
+# are whole read-only namespaces, and the rest are the individual readers.
+# Anything not here -- a verb this list has not learned included -- is treated
+# as a write, which is the safe direction for a guard whose job is to stop
+# state being built over a dead clock.
+READ_VERB_PREFIXES = ("query.", "assets.")
+READ_VERBS = frozenset((
+    "mods.list", "harmony.patches", "ui.screenshot", "ui.tooltip",
+    "ui.describe", "combat.status", "prompts.list", "saves.list", "version",
+    # `action.list` is the reflection catalog of invokable action classes and
+    # has no tool of its own, so `raw` is the only way to read it and the
+    # allowlist is the only thing that decides. `ping` and `verbs` are the two
+    # verbs that answer with no campaign loaded and change nothing at all.
+    "action.list", "ping", "verbs"))
 
 # Read-only tools that report the limit themselves. Prefixing the banner as
 # well would say the same thing twice on the one call an agent reads closely.
@@ -165,10 +216,11 @@ def _initial_limit():
         return float(PAUSE_LIMIT_SECONDS)
 
 
-# Session state, not a constant: the pause_limit tool sets it, so a QA run can
-# tune or disable the limit without restarting the server. Every observe says
-# what it is, so a run that raised it cannot hide that it did.
-_LIMIT = {"seconds": _initial_limit()}
+# Session state, not a constant: the set_pause_limit tool writes it, so a QA
+# run can tune or disable the limit without restarting the server. Every
+# observe says what it is and when it was last changed, so a run that raised it
+# cannot hide that it did.
+_LIMIT = {"seconds": _initial_limit(), "changedAt": None}
 
 # The record of what the stall did to this session. `stallViolations` counts
 # episodes -- one per continuous stall that crossed the limit, however many
@@ -188,8 +240,13 @@ def pause_limit():
     return _LIMIT["seconds"]
 
 
-def set_pause_limit(seconds):
-    """Set the limit for this session. 0 disables it."""
+def set_pause_limit(seconds, record=False):
+    """Set the limit for this session. 0 disables it.
+
+    `record` stamps the change, which is what observe reports. Only the tool
+    passes it: a test or a fixture restoring the limit it found is not a run
+    deciding to run with a different one.
+    """
     try:
         value = float(seconds)
     except (TypeError, ValueError):
@@ -197,21 +254,88 @@ def set_pause_limit(seconds):
     if value < 0:
         raise ToolError("seconds must be 0 or more (0 disables the limit)")
     _LIMIT["seconds"] = value
+    if record:
+        _LIMIT["changedAt"] = _time.strftime("%Y-%m-%dT%H:%M:%S")
     return value
 
 
 def limit_state():
-    """The limit and whether it is the shipped default, for observe."""
+    """The limit, whether it is the shipped default, and when it last moved.
+
+    All three on every observe. A run that raised the limit and then reported
+    a clean sweep has to be readable as what it was, and the seconds alone do
+    not say whether the value was chosen or inherited from the environment.
+    """
     limit = pause_limit()
     return {"limitSeconds": limit,
             "limitIsDefault": limit == float(PAUSE_LIMIT_SECONDS),
-            "defaultSeconds": PAUSE_LIMIT_SECONDS}
+            "defaultSeconds": PAUSE_LIMIT_SECONDS,
+            "limitChangedAt": _LIMIT["changedAt"]}
+
+
+def _speed_level(value):
+    """The speed level an argument names, or None when it names none.
+
+    Coerced, because the wire is JSON and a client that types its arguments
+    loosely sends "0" for 0 -- which the DLL accepts as a pause and this
+    module used to let through as something else entirely. A boolean is not a
+    level: bool is an int in Python and False would read as speed 0.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _stops_the_clock(args):
     """A `time` call that pauses. Speed 0 is a pause by its other name."""
     args = args or {}
-    return args.get("action") == "pause" or args.get("speed") == 0
+    if args.get("action") == "pause":
+        return True
+    return _speed_level(args.get("speed")) == 0
+
+
+def _speed_arg(value):
+    """The `level` a `time.speed` call carries for this `speed` argument.
+
+    The DLL takes the JSON integer token and nothing else, and the pause gate
+    reads the same argument through `_speed_level`, which coerces. Without the
+    same coercion here the two disagree over a loosely typed client: the gate
+    reads `"0"` as the pause it is and refuses it over a stalled clock, and
+    under the limit the DLL refuses the same string for its type -- so the one
+    call that would clear the stall never lands whichever side of the limit it
+    is made on.
+
+    Only a whole number is coerced. Anything else goes through untouched, so
+    the refusal comes from the DLL, which is the side that knows the levels.
+    """
+    level = _speed_level(value)
+    try:
+        whole = int(level)
+    except (TypeError, ValueError, OverflowError):
+        return value
+    return whole if level == whole else value
+
+
+def _read_verb(cmd):
+    """Whether this bridge verb only reads."""
+    return isinstance(cmd, str) and (
+        cmd in READ_VERBS or cmd.startswith(READ_VERB_PREFIXES))
+
+
+def _passthrough_verbs(name, args):
+    """Every bridge verb a raw or batch call would send, or None when the call
+    does not say. A step list this cannot read is not an empty one."""
+    args = args or {}
+    if name == "raw":
+        cmd = args.get("cmd")
+        return [cmd] if cmd else None
+    steps = args.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None
+    return [s.get("cmd") if isinstance(s, dict) else None for s in steps]
 
 
 def pause_decision(name, args, read_only, stall, limit):
@@ -227,13 +351,25 @@ def pause_decision(name, args, read_only, stall, limit):
     thing to read: a researcher, a reviewer or the user looking at a paused game
     is not the failure this exists for. They get the banner instead, which puts
     the stall in front of whoever is driving without blocking whoever is not.
+
+    `raw` and `batch` are decided by the verbs they carry, for the same reason:
+    the name says nothing about whether the call reads or writes, and taking
+    them at their name let every refused write through under another spelling.
     """
     if not limit or stall is None or stall <= limit:
         return "run"
     if name == "time" and _stops_the_clock(args):
         return "refuse"
+    if name in PAUSE_BANNER_ANYWAY:
+        verbs = _passthrough_verbs(name, args)
+        if verbs and all(_read_verb(v) for v in verbs):
+            return "banner"
+        # Includes a call whose verbs could not be read: over the limit, a
+        # passthrough that will not say what it sends is refused rather than
+        # guessed at.
+        return "refuse"
     if name in PAUSE_EXEMPT:
-        return "banner" if name in PAUSE_BANNER_ANYWAY else "run"
+        return "run"
     if read_only:
         return "banner"
     return "refuse"
@@ -332,17 +468,27 @@ def stall_counters():
     return out
 
 
+# What _refresh_stall answers when the query.time itself failed, which is not
+# the same as a reply that carried no stall block. The first says nothing was
+# measured and the cached seconds are now stale by however long the call took;
+# the second is a DLL older than the key, whose cached seconds are current.
+# One value used to stand for both, and a caller that could not tell them apart
+# went on refusing calls over a reading taken before the bridge died.
+UNREADABLE = object()
+
+
 def _refresh_stall():
     """One query.time, for the reading and its diagnosis both.
 
-    A refresh that fails, times out or finds no campaign reads as unknown: the
-    reply's envelope has already updated the cache, and a bridge that answered
-    nothing leaves it as it was. Unknown never refuses.
+    Returns the stall block, None when the reply carried none, or UNREADABLE
+    when the call failed, timed out or found no campaign. Unknown never
+    refuses, but the caller has to know which unknown it has: a failed call
+    invalidates the cached seconds it was refreshing.
     """
     try:
         return _stall_block(bridge.call("query.time"))
     except (BridgeError, VerbError):
-        return None
+        return UNREADABLE
 
 
 def current_reading():
@@ -351,11 +497,18 @@ def current_reading():
     The seconds are cached off the last response envelope of any verb, so an
     ordinary session keeps them fresh for free; the diagnosis only comes from
     query.time, so it is None until something refreshes.
+
+    A refresh that could not be taken answers unknown for both. The cached
+    seconds it was sent to replace are no longer a reading of anything: the
+    call that failed cleared them (bridge.clear_stall), and the game they
+    described may not be running at all.
     """
     seconds, age = bridge.last_stall()
     block = None
     if age is None or age > STALL_CACHE_SECONDS:
         block = _refresh_stall()
+        if block is UNREADABLE:
+            return None, None
         seconds, _age = bridge.last_stall()
         if block is not None and block.get("seconds") is not None:
             seconds = block["seconds"]
@@ -429,7 +582,16 @@ def pause_gate(name, args, read_only=False):
     # One extra verb, only on the readings that are about to refuse something.
     if block is None and stall is not None and stall > limit:
         block = _refresh_stall()
-        if isinstance(block, dict) and block.get("seconds") is not None:
+        if block is UNREADABLE:
+            # The bridge did not answer, so there is no reading here at all --
+            # not even the cached one, which the failed call has just cleared
+            # and which describes a game that may have died since. Refusing
+            # the call on it would answer a dead bridge with a stall report;
+            # unknown lets the tool run and fail with its own error, which is
+            # the one that says what actually happened.
+            stall = bridge.last_stall()[0]
+            block = None
+        elif isinstance(block, dict) and block.get("seconds") is not None:
             # The refresh is a newer reading than the cache it replaced, and
             # the clock may have moved in between.
             stall = block["seconds"]
@@ -472,9 +634,16 @@ def pause_gate(name, args, read_only=False):
 # the pass that answers prompts declined to run, and nothing this loop does
 # between calls changes its mind. Only the caller can, by fixing what the
 # refusal names.
+# `bridge_lost` and a terminal `crashed` are in it for a fourth form of the
+# same reason: both hand back a digest, so both leave the caller able to call
+# again, and neither is a state any number of further calls changes. A bridge
+# that has stopped answering and a game that crashed a second time after its
+# automatic restart are exactly the runs that must escalate to the refusal
+# rather than loop. `crash_recovered` is the one that clears the counter: the
+# game came back, the save reloaded, and the next call has a live game to run.
 INERT_STOPS = frozenset(
     ("no_progress", "unknown", "mission_phase", "pause_limit",
-     "active_player_moved", "prompts_refused"))
+     "active_player_moved", "prompts_refused", "bridge_lost", "crashed"))
 
 
 def _note_progress(days, reason):
@@ -492,6 +661,7 @@ def _note_progress(days, reason):
     # way clears the budget.
     if days > 0 and reason not in ("crashed", "crash_recovered"):
         _RUN["crashRecoveries"] = 0
+        _RUN["crashRestarted"] = False
 
 
 def _reset_run(keep_macro=False):
@@ -516,6 +686,143 @@ def _reset_run(keep_macro=False):
     _RUN["zeroReasons"] = []
     if not keep_macro:
         _RUN["macroOn"] = False
+
+
+def _forget_entry():
+    """Forget the campaign this run was entering, and the save behind it.
+
+    For the two calls that end a process: a launch and a stop. Everything
+    `_entered_campaign` records describes a campaign in the process being
+    replaced, and `campaignPending` is a promise that the NEXT campaign token
+    is the one this run ordered. Left set across a launch, that promise binds
+    a save from the dead process to whatever campaign comes up next -- a
+    campaign started by hand from the start screen would be recorded as
+    playing it, and a crash recovery would reload it, resuming a game nobody
+    asked for while reporting a recovery.
+
+    Not folded into `_reset_run`: `note_campaign` calls that with the entry it
+    has just bound, and clearing there would drop the binding it exists to
+    make.
+    """
+    _RUN["campaignAt"] = None
+    _RUN["campaignPending"] = False
+    _RUN["entryProcess"] = None
+    _RUN["save"] = None
+    _RUN["saveToken"] = None
+
+
+def _stamp():
+    """Now, in the format the DLL reports save mtimes in.
+
+    Both sides read the same clock: the verb answers
+    File.GetLastWriteTime formatted as local time, and the bridge is a
+    loopback listener, so the game and this process are on one machine. The
+    format sorts lexically, which is what the save picker compares on.
+    """
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _entered_campaign(save=None, extension=None):
+    """Record that this run is entering a campaign, and on what.
+
+    `save` is the save being loaded, None for a campaign started fresh. The
+    token is left unbound: the campaign this save is being loaded into has not
+    come up yet, and the next token change is the one it belongs to.
+
+    The moment is stamped here rather than when the new campaign is first seen,
+    which is up to a poll later. Earlier is the safe direction: everything
+    written from now on belongs to this run, and the load itself writes
+    nothing.
+
+    The game process is recorded with it. An entry is a promise about the next
+    campaign IN THIS GAME, and it is worth nothing in the next one.
+    """
+    _RUN["campaignAt"] = _stamp()
+    _RUN["campaignPending"] = True
+    _RUN["entryProcess"] = bridge.last_campaign_process()
+    _RUN["save"] = ({"name": save, "extension": extension} if save else None)
+    _RUN["saveToken"] = None
+
+
+def _note_process():
+    """Forget the campaign entry when the game it was ordered in is gone.
+
+    `game_start` and `game_stop` forget it for the processes this server
+    replaces, and until this ran that was every process it knew about. It is
+    not every process there is: a person can close the game at the console and
+    start it again, and on the Windows test machine that is the ordinary way it
+    gets launched. What that leaves behind is an entry promising that the next
+    campaign token is the one this run ordered, plus a save from a game that no
+    longer exists -- so a campaign started by hand in the new process is
+    recorded as the one the run ordered, and a crash recovery reloads the dead
+    run's save into it.
+
+    The token cannot catch this on its own. Its counter restarts at 1 in every
+    process, so the first campaign of the replacement game answers a token this
+    session may already have seen. The process key is what differs, and it
+    differs on the FIRST envelope of the new game, before any campaign is up.
+
+    Either key being None is no information rather than a change: a DLL older
+    than the key never sends one, and an entry ordered before this server ever
+    read one cannot be dated by it.
+    """
+    if _RUN["entryProcess"] is None:
+        return False
+    process = bridge.last_campaign_process()
+    if process is None or process == _RUN["entryProcess"]:
+        return False
+    _forget_entry()
+    return True
+
+
+def note_campaign():
+    """React to a campaign this server has not seen before.
+
+    Called before every tool call, because the transition need not have gone
+    through a tool: the in-game Options > Exit and a campaign started from the
+    start screen both reach a new campaign with no verb of ours involved, and
+    every counter kept here would otherwise go on describing a campaign that
+    no longer exists.
+
+    `macroOn` is deliberately untouched. The autopilot macro is a live
+    MonoBehaviour that survives an in-process load, which is the same reason
+    `load_game` resets with `keep_macro=True`; clearing it here would stop the
+    advance loop watching a macro that is still running.
+    """
+    _note_process()
+    token = bridge.last_campaign_token()
+    # None is no information rather than a campaign of its own: an old DLL
+    # sends no token, and the gap between two campaigns is not a third one.
+    if token is None or token == _RUN["campaignToken"]:
+        return False
+    _RUN["campaignToken"] = token
+    ordered = _RUN["campaignPending"]
+    _RUN["campaignPending"] = False
+    if ordered and _RUN["save"] is not None:
+        if _RUN["saveToken"] not in (None, token):
+            # The save is already bound, and to a campaign that is not this
+            # one -- it was written in the campaign the ordered entry replaced,
+            # so it says nothing about this one. Binding it here would have a
+            # crash recovery reload another campaign's save.
+            _RUN["save"] = None
+            _RUN["saveToken"] = None
+        else:
+            # Unbound, so it is the save this entry was ordered with: the
+            # campaign it was loaded into is this one.
+            _RUN["saveToken"] = token
+    elif not ordered:
+        # A campaign nothing here ordered, so there is no earlier moment to
+        # date it from and no save this run is known to be playing. A save the
+        # last campaign was loaded from is no evidence about this one, and
+        # reloading it after a crash would silently resume a different game.
+        _RUN["campaignAt"] = _stamp()
+        _RUN["save"] = None
+        _RUN["saveToken"] = None
+    # The same reset the lifecycle tools take, rather than a second copy of
+    # the fields it clears: keeping the macro is the whole difference, and it
+    # is the argument that says so.
+    _reset_run(keep_macro=True)
+    return True
 
 
 def _bridge_down(seconds=BRIDGE_DOWN_WAIT):
@@ -902,11 +1209,17 @@ def _start_clock(target, force):
     poll into a hold. Every other failed arm still plays: those are transport
     failures with no phase behind them, and a clock left down for one would
     stall the run for nothing.
+
+    The arm goes FIRST for the same reason. time.speed 5 is handing the clock
+    back on its own -- the game runs at full speed with or without a target --
+    so sending it before the arm meant a refused arm had already done the
+    thing the refusal exists to prevent, and the hold that followed was a hold
+    over a clock this call had just started.
     """
-    _try("time.speed", {"level": 5})
     armed, refusal = _arm_run_until(target.isoformat(), force)
     if refusal == "mission_phase":
         return False, refusal
+    _try("time.speed", {"level": 5})
     _resume()
     return armed, None
 
@@ -1086,7 +1399,19 @@ def _campaign_loaded():
 
 
 def _wait_secs(value, default=CAMPAIGN_WAIT):
-    if value in (None, True, False):
+    """Seconds to wait, from an argument that may be absent or a flag.
+
+    Only None is absent. A boolean is a client saying "wait" rather than a
+    number of seconds, so it takes the default too -- int(True) is a
+    one-second wait, which is a wait that always fails. Everything else is the
+    caller's own number, including 0.
+
+    The membership test this replaces was `value in (None, True, False)`, and
+    bool is an int in Python: 0 equals False and 1 equals True, so a caller
+    asking for no wait at all, or for one second, was given the full default
+    instead.
+    """
+    if value is None or isinstance(value, bool):
         return default
     return int(value)
 
@@ -1182,13 +1507,32 @@ def _pause_line(report):
 
 
 def pause_limit_tool(args, progress=None):
-    """Read the pause limit, or set it for the rest of this server session."""
-    if args.get("seconds") is not None:
-        set_pause_limit(args["seconds"])
+    """Read the pause limit and this session's stall counters.
+
+    Read-only, and the write lives in set_pause_limit below. One tool that did
+    both had to be marked a write, so reading the limit was itself refused
+    over a stalled clock -- the one reading an agent takes to find out why
+    everything else is being refused.
+    """
     out = stall_counters()
-    out["note"] = ("0 disables the limit. It is server session state: it "
-                   "lasts until this server process exits and is written "
-                   "nowhere.")
+    out["note"] = ("set_pause_limit seconds=N changes it, 0 disables it. It "
+                   "is server session state: it lasts until this server "
+                   "process exits and is written nowhere.")
+    return out
+
+
+def set_pause_limit_tool(args, progress=None):
+    """Set the pause limit for the rest of this server session."""
+    seconds = args.get("seconds")
+    if seconds is None:
+        raise ToolError("set_pause_limit needs seconds=N (0 disables the "
+                        "limit); pause_limit reads the current one")
+    set_pause_limit(seconds, record=True)
+    out = stall_counters()
+    out["note"] = ("the limit is server session state: it lasts until this "
+                   "server process exits and is written nowhere. Every "
+                   "observe reports it, so a run that changed it cannot hide "
+                   "that it did.")
     return out
 
 
@@ -1302,15 +1646,25 @@ def game_start(args, progress=None):
     load = args.get("load")
     # A launch or a load replaces the process or the campaign the run counters
     # describe, so they are dropped up front rather than at whichever exit is
-    # taken. Cheap and unconditional: the no-op branch (bridge already up, no
-    # load) is a caller re-confirming the game is there, and a run whose state
-    # is worth keeping across that has nothing here to lose but a stall count
-    # it can re-earn in two calls.
-    _reset_run()
+    # taken.
+    #
+    # The macro is the exception, and it is decided by whether a process is
+    # about to be replaced. A launch kills the MonoBehaviour with the process.
+    # A call that launches nothing does not: the no-op branch is a caller
+    # re-confirming the game is there, and a load= into a running game is the
+    # same in-process load `load_game` does, after which the macro is still
+    # running. Clearing the flag on those stopped `advance` polling
+    # query.autopilot, and a macro that had switched itself off then went
+    # unnoticed for the rest of the run.
+    already_up = _bridge_up()
+    _reset_run(keep_macro=already_up)
     out = {"launched": False}
-    if _bridge_up():
+    if already_up:
         out["bridge"] = "up (already running)"
     else:
+        # A new process. Whatever campaign the last one was entering never
+        # arrived, and the save behind it belongs to a game that is gone.
+        _forget_entry()
         try:
             if IS_WINDOWS:
                 # The Steam URL protocol; the shell association reaches Steam
@@ -1349,10 +1703,14 @@ def game_start(args, progress=None):
         out["bridge"] = "up"
         out["bridgeUpAfterSeconds"] = round(_time.monotonic() - t0)
     if load:
+        a = {"name": load}
+        if args.get("extension"):
+            a["extension"] = args["extension"]
         try:
-            bridge.call("saves.load", {"name": load})
+            bridge.call("saves.load", a)
         except VerbError as e:
             raise ToolError("load failed: %s%s" % (e, _saves_hint()))
+        _entered_campaign(load, args.get("extension"))
         out["load"] = load
         out["campaign"] = _wait_campaign(_wait_secs(args.get("wait_campaign")),
                                          progress)
@@ -1363,6 +1721,10 @@ def game_start(args, progress=None):
 
 
 def game_stop(args, progress=None):
+    # The campaign goes with the process, whether or not the kill below finds
+    # anything to kill: a run that ordered a load and then stopped the game
+    # must not have that save bound to the next campaign anyone starts.
+    _forget_entry()
     if IS_WINDOWS:
         try:
             proc = subprocess.run(["taskkill", "/IM", EXE_NAME, "/F"],
@@ -1476,19 +1838,63 @@ def _crashed(t):
     return isinstance(t, dict) and t.get("crashed") is True
 
 
-def _newest_save():
-    """The most recently written save, or None. Sorted on the mtime the DLL
-    reports; ties fall back to name order so the pick is deterministic."""
+def _save_rows():
+    """Every save the DLL lists, as {name, extension, mtime} rows."""
     saves = _try("saves.list")
     if isinstance(saves, dict):
         saves = saves.get("saves", saves)
     if not isinstance(saves, list):
+        return []
+    return [s for s in saves if isinstance(s, dict) and s.get("name")]
+
+
+def _engine_written(name):
+    """Whether the game writes this save on its own.
+
+    The names it uses are Autosave, Autosave2, Autosave3, CombatAutosave and
+    ExitSave, so the test is a substring rather than a list that a numbered
+    slot would fall out of. A player save that happens to match costs nothing:
+    the picker also requires an mtime inside this run's campaign, and a file
+    written during the run IS of the run whatever it is called.
+    """
+    low = str(name).lower()
+    return "autosave" in low or low.startswith("exitsave")
+
+
+def _run_save():
+    """The newest save of THIS run, or None.
+
+    Never simply the newest save on disk. The folder holds other people's
+    campaigns and other runs of this harness, and reloading one of those after
+    a crash resumes a game nobody asked for while reporting a recovery.
+
+    Two things qualify. Anything the game wrote by itself after this run
+    entered its campaign is of that campaign by construction. So is the save
+    the run loaded, which is the fallback when the crash came before the first
+    autosave. The newest of the two wins, on the mtime the DLL reports.
+    """
+    rows = _save_rows()
+    if not rows:
         return None
-    named = [s for s in saves if isinstance(s, dict) and s.get("name")]
-    if not named:
+    candidates = []
+    entered = _RUN["campaignAt"]
+    if entered:
+        candidates = [r for r in rows if _engine_written(r["name"])
+                      and str(r.get("mtime") or "") >= entered]
+    loaded = _RUN["save"]
+    if loaded:
+        # By name AND extension when the extension is known, which is the only
+        # way to name one of two twins. With it unknown, every twin of the stem
+        # is a candidate and the newest of them wins below -- the same answer
+        # the DLL's own bare-name search gives.
+        candidates += [r for r in rows if r["name"] == loaded["name"]
+                       and (loaded.get("extension") is None
+                            or r.get("extension") == loaded["extension"])]
+    if not candidates:
         return None
-    named.sort(key=lambda s: (str(s.get("mtime") or ""), str(s["name"])))
-    return named[-1]
+    # Ties fall back to name order, so the pick is deterministic.
+    candidates.sort(key=lambda s: (str(s.get("mtime") or ""), str(s["name"])))
+    return candidates[-1]
 
 
 def _recover_from_crash(digest, at, progress=None):
@@ -1503,24 +1909,45 @@ def _recover_from_crash(digest, at, progress=None):
     support links.
     """
     digest["crash"] = {"detectedAt": at.isoformat()}
-    if _RUN["crashRecoveries"] >= MAX_CRASH_RECOVERIES:
-        digest["crash"]["recovered"] = False
-        digest["next"] = (
-            "the game crashed again after an automatic restart, so this one "
-            "was not retried: a crash that recurs on reload would otherwise "
-            "become a restart loop. Read log_tail which=player for the "
-            "exception, then decide by hand. game_start load=<save> resumes "
-            "once the cause is understood.")
-        return "crashed"
-
-    save = _newest_save()
+    # The save is looked up before the budget so the terminal text can name
+    # the blocker that is actually in the way. The budget survives campaign
+    # changes and is spent by an attempt rather than by a completed restart,
+    # so "crashed again after an automatic restart" is not true of every run
+    # that reaches it, and a run with nothing to reload is told the one thing
+    # it can act on.
+    save = _run_save()
     if save is None:
         digest["crash"]["recovered"] = False
         digest["next"] = (
-            "the game crashed and there is no save to reload, so nothing was "
-            "restarted -- a fresh campaign is never started automatically, "
-            "because it would silently replace the run being measured. Read "
-            "log_tail which=player for the exception.")
+            "the game crashed and there is no save OF THIS RUN to reload, so "
+            "nothing was restarted: no autosave has been written since the "
+            "campaign was entered, and the run did not come from a save. The "
+            "newest save on disk is not a substitute -- it can belong to "
+            "another campaign entirely, and reloading it would resume a game "
+            "nobody asked for while reporting a recovery. A fresh campaign is "
+            "never started automatically for the same reason. Read log_tail "
+            "which=player for the exception, then load_game name=<save> to "
+            "choose one by hand.")
+        return "crashed"
+
+    if _RUN["crashRecoveries"] >= MAX_CRASH_RECOVERIES:
+        digest["crash"]["recovered"] = False
+        if _RUN["crashRestarted"]:
+            digest["next"] = (
+                "the game crashed again after an automatic restart, so this "
+                "one was not retried: a crash that recurs on reload would "
+                "otherwise become a restart loop. Read log_tail which=player "
+                "for the exception, then decide by hand. game_start "
+                "load=<save> resumes once the cause is understood.")
+        else:
+            digest["next"] = (
+                "the game crashed again with this run's one automatic "
+                "restart already spent by a recovery that never got as far "
+                "as restarting anything, so this one was not retried: a "
+                "crash that recurs would otherwise become a restart loop. "
+                "Read log_tail which=player for the exception, then decide "
+                "by hand. game_start load=<save> resumes once the cause is "
+                "understood.")
         return "crashed"
 
     _RUN["crashRecoveries"] += 1
@@ -1553,7 +1980,11 @@ def _recover_from_crash(digest, at, progress=None):
                 "scene load, so the reloaded game comes back degraded. Kill "
                 "it by hand, then game_start load=<save>." % BRIDGE_DOWN_WAIT)
             return "crashed"
-        game_start({"load": save.get("name")}, progress)
+        # The extension goes with the name: with both twins of a stem on
+        # disk, the profile setting decides which one a bare name resolves
+        # to, and that need not be the file whose mtime was just read.
+        game_start({"load": save.get("name"),
+                    "extension": save.get("extension")}, progress)
     except (ToolError, BridgeError, VerbError) as e:
         # Widened past ToolError: the save load inside game_start reaches the
         # bridge, and a transport failure there would otherwise unwind the
@@ -1564,6 +1995,9 @@ def _recover_from_crash(digest, at, progress=None):
                           "load=<save> by hand." % e)
         return "crashed"
     digest["crash"]["recovered"] = True
+    # A restart that got all the way here is the only one the terminal text
+    # may claim: the two exits above spend the budget without one.
+    _RUN["crashRestarted"] = True
     # A new process carries no macro. Leaving the flag set would have the next
     # call poll a switch nobody threw and stop on it.
     _RUN["macroOn"] = False
@@ -1717,6 +2151,10 @@ def advance(args, progress=None):
     t0 = _time.monotonic()
     stuck = 0
     unknown_polls = 0
+    # Consecutive clock reads that went unanswered. One is a busy main thread
+    # and is retried; a run of them is a bridge nothing is going to answer,
+    # and polling on to the budget over it reports a dead game as a slow one.
+    lost_polls = 0
     # Polls of this call that got a clock reading, for the pause limit.
     polls = 0
     # Polls of THIS hold on which the alert box was open with live options.
@@ -1747,6 +2185,22 @@ def advance(args, progress=None):
             except BridgeTimeout as e:
                 digest["lostPolls"] = digest.get("lostPolls", 0) + 1
                 digest["lastLostPoll"] = str(e)
+                lost_polls += 1
+                if lost_polls >= LOST_POLLS_MAX:
+                    digest["stopReason"] = "bridge_lost"
+                    digest["bridgeError"] = str(e)
+                    digest["next"] = (
+                        "%d clock reads in a row went unanswered (%s), so "
+                        "this call stopped rather than spend its budget on a "
+                        "bridge that is not answering. Each of them waited "
+                        "the full verb timeout, so the game has been silent "
+                        "for minutes rather than seconds and nothing here "
+                        "knows what it is doing. observe reports whether the "
+                        "process is still there: with it up the main thread "
+                        "is busy and advance can be called again, and with it "
+                        "gone game_start relaunches."
+                        % (lost_polls, e))
+                    break
                 if _time.monotonic() - t0 > max_seconds:
                     digest["stopReason"] = "max_seconds"
                     digest["next"] = (
@@ -1757,6 +2211,7 @@ def advance(args, progress=None):
                            _armed_note(armed), target.isoformat()))
                     break
                 continue
+            lost_polls = 0
             previous = cur
             cur = _date_of(t)
             if cur > previous:
@@ -2293,8 +2748,29 @@ def _combat_orphan(report, status):
     removed until the accept. A slow resolution therefore looks exactly like an
     orphan from outside, minus the one thing that tells them apart -- whether
     an unresolved combat is still there.
+
+    Both conditions are read, never assumed. A screen read that fails says
+    nothing about the canvas, and reading it as a canvas that is down is the
+    same mistake the status poll used to make: it turns silence into the one
+    answer that allows the drop.
     """
-    screen = _try("combat.precombat", {"action": "status"}) or {}
+    try:
+        screen = bridge.call("combat.precombat", {"action": "status"})
+        unread = None if isinstance(screen, dict) else (
+            "combat.precombat answered with no screen object")
+    except (BridgeError, VerbError) as e:
+        screen = None
+        unread = str(e)
+    if unread is not None:
+        report["precombat"] = None
+        report["orphanPrompt"] = None
+        report["orphanPromptDropped"] = False
+        report["orphanPromptNote"] = (
+            "the precombat screen could not be read (%s), so whether the "
+            "canvas is up is unknown and any standing %s was left alone. "
+            "combat_precombat action=status reads the screen once the bridge "
+            "answers again." % (unread, BEGIN_COMBAT))
+        return
     report["precombat"] = screen
     if screen.get("canvasUp"):
         report["orphanPrompt"] = None
@@ -2305,7 +2781,26 @@ def _combat_orphan(report, status):
             "a combat is still unresolved, so any standing begin-combat "
             "prompt belongs to it and was left alone")
         return
-    listing = _try("prompts.list")
+    # Read with the error kept, not through _try. A queue nobody could read
+    # answers `standing` with an empty list, which is the same shape as a
+    # queue with nothing in it -- and the tool would then report "nothing was
+    # standing" about a prompt it never looked for, which is the reading that
+    # stops anyone looking again.
+    try:
+        listing = bridge.call("prompts.list")
+        listing_error = None
+    except (BridgeError, VerbError) as e:
+        listing = None
+        listing_error = str(e)
+    if listing_error is not None:
+        report["orphanPrompt"] = None
+        report["orphanPromptDropped"] = False
+        report["orphanPromptNote"] = (
+            "the prompt queue could not be read (%s), so whether a %s is "
+            "standing is unknown and nothing was dropped. prompts reads the "
+            "queue once the bridge answers again."
+            % (listing_error, BEGIN_COMBAT))
+        return
     standing = _begin_combat_prompts(listing)
     if not standing:
         report["orphanPrompt"] = None
@@ -2368,12 +2863,49 @@ def combat_autoresolve(args, progress=None):
     t0 = _time.monotonic()
     status = {}
     ar = {}
+    # Consecutive polls that came back with no status. A poll that raises says
+    # NOTHING about the resolution, and the loop used to read it as a status
+    # with no autoresolve block in it -- which is exactly the shape of a clean
+    # disarm. So a dead bridge ended the wait with `resolved: true`, and the
+    # orphan pass that runs on that path saw an empty status, took it for "no
+    # combat left", and dropped the begin-combat prompt of a fight that was
+    # still on screen.
+    lost = 0
+    last_lost = None
+    # How many of that consecutive run timed out rather than failed. A timeout
+    # is a main thread too busy to answer, with the socket open and the game
+    # up; anything else is the socket. The two end the call under different
+    # stop reasons because the way out differs.
+    lost_timeouts = 0
     while True:
         _time.sleep(2)
         if progress:
             progress(int(_time.monotonic() - t0), int(seconds),
                      "autoresolving (%s)" % (ar.get("phase") or "arming"))
-        status = _try("combat.status") or {}
+        polled = None
+        why = None
+        timed_out = False
+        try:
+            # BridgeTimeout is a BridgeError: the main thread being busy is a
+            # state a resolution itself produces, so one of those is a poll to
+            # take again rather than a reason to stop.
+            polled = bridge.call("combat.status")
+        except (BridgeError, VerbError) as e:
+            why = str(e)
+            timed_out = isinstance(e, BridgeTimeout)
+        if why is None and not isinstance(polled, dict):
+            why = "combat.status answered with no status object"
+        if why is not None:
+            lost += 1
+            if timed_out:
+                lost_timeouts += 1
+            last_lost = why
+            if lost >= LOST_POLLS_MAX or _time.monotonic() - t0 > seconds:
+                break
+            continue
+        lost = 0
+        lost_timeouts = 0
+        status = polled
         ar = status.get("autoresolve") or {}
         if not ar.get("armed"):
             break
@@ -2390,6 +2922,50 @@ def combat_autoresolve(args, progress=None):
     report["note"] = ar.get("note")
     # As of the last poll, which is BEFORE any orphan drop below.
     report["blocked"] = status.get("blocked")
+
+    if lost:
+        # The wait ended on unanswered polls, so every reading above belongs
+        # to the last poll that did answer, and there may have been none. The
+        # resolution is not reported either way, and the orphan pass is not
+        # run at all: it decides from a status, and a status nobody read looks
+        # identical to a combat that is over.
+        #
+        # Which of the two transport stops it was follows from what the polls
+        # did. Every one of them timing out is a main thread that never came
+        # back inside the verb timeout, with the socket open and the game up,
+        # and a resolution can produce exactly that: the wait is longer than
+        # the timeout by design. Anything else -- a refused verb, a closed
+        # socket, a reply that was not a status -- is the bridge itself.
+        busy = lost_timeouts == lost
+        report["resolved"] = False
+        report["stopReason"] = "bridge_busy" if busy else "bridge_lost"
+        report["lostPolls"] = lost
+        report["bridgeError"] = last_lost
+        report["_failed"] = True
+        if busy:
+            report["next"] = (
+                "the last %d combat.status poll(s) timed out (%s), so the "
+                "main thread is busy rather than gone and what the resolution "
+                "did is unknown; nothing was done about the begin-combat "
+                "prompt, since dropping one on a fight still waiting for a "
+                "button is worse than leaving it. Read combat_status first: "
+                "the resolution may well have finished while the polls were "
+                "going unanswered, and calling combat_autoresolve on a "
+                "combat that is over is refused as an unsafe re-arm. Go back "
+                "to waiting with combat_autoresolve on the same combat only "
+                "if combat_status still reports it armed -- that call reports "
+                "the status and does not arm a second time, so no one-shot "
+                "fires twice." % (lost, last_lost))
+        else:
+            report["next"] = (
+                "the last %d combat.status poll(s) went unanswered (%s), so "
+                "what the resolution did is unknown and nothing was done "
+                "about the begin-combat prompt -- dropping one on a fight "
+                "still waiting for a button is worse than leaving it. observe "
+                "reports whether the process is still there; with the game "
+                "up, combat_status reads the machine and combat_precombat "
+                "action=status the screen." % (lost, last_lost))
+        return report
 
     if report.get("stalled"):
         _combat_orphan(report, status)
@@ -2513,6 +3089,18 @@ def _scan_logs(marks, cap=40):
     return {"failures": failures, "noise": noise, "capped": capped}
 
 
+def _bridge_stop(e):
+    """The stop reason a transport failure earns.
+
+    The same split `advance` and the autoresolve wait make. A timeout is a
+    main thread too busy to answer inside the verb budget, with the socket
+    open and the game up; anything else is the socket. Calling both of them
+    `bridge_lost` would send a reader to relaunch a game that is still
+    running and only slow.
+    """
+    return "bridge_busy" if isinstance(e, BridgeTimeout) else "bridge_lost"
+
+
 def smoke_test(args, progress=None):
     days = int(args.get("days", 3))
     if args.get("scenario"):
@@ -2541,40 +3129,105 @@ def smoke_test(args, progress=None):
         # the fallback, for a DLL that has no such verb and for a return that
         # does not complete.
         relaunched = None
-        if _campaign_loaded():
-            try:
+        relaunch_error = None
+        # Whether this row paid for a menu return. The step runs for a named
+        # scenario exactly as it does for a sweep -- a client that asks for one
+        # scenario with a campaign up is the ordinary case, not a misuse -- and
+        # the row says so, because a campaign.new refused for a start screen
+        # that is not there reads the same whether the return never ran or ran
+        # and did not finish landing.
+        returned_to_menu = False
+        try:
+            if _campaign_loaded():
                 main_menu({}, progress)
-            except (ToolError, VerbError) as e:
-                relaunched = str(e)
+                returned_to_menu = True
+        except (ToolError, VerbError, BridgeError) as e:
+            # A transport failure joins the other two here because the way out
+            # is the same one: the scenario before this one may have taken the
+            # game down with it, and then every call on this path fails the
+            # way a menu return that will not complete does. Relaunching is
+            # what lets the scenarios after a lost bridge be tested at all.
+            relaunched = str(e)
+            try:
                 game_stop({})
                 _time.sleep(5)
                 game_start({})
+            except (ToolError, VerbError, BridgeError) as relaunch:
+                # A recovery that cannot run is reported, and the sweep carries
+                # on to spend this scenario's steps against whatever is left.
+                # They fail and the row says so, which is a report; an
+                # exception raised here would end the sweep instead, leaving
+                # every scenario after it untested and unmentioned.
+                relaunch_error = str(relaunch)
         marks = _log_marks()
         row = {"scenario": name}
+        if returned_to_menu:
+            row["returnedToMenu"] = True
         if relaunched:
             # Said out loud. A silent fallback to a relaunch is the same cost
             # the menu return exists to remove, and a run that pays it twice
             # should show why.
             row["relaunchedBecause"] = relaunched
+        if relaunch_error:
+            row["relaunchFailed"] = relaunch_error
+        # The step about to run, so a row that fails names what it reached
+        # rather than leaving the reader to guess how far the scenario got.
+        # The menu return above is not one of the values: it reports itself,
+        # through `relaunchedBecause` and `relaunchFailed`, and the scenario
+        # is tried from wherever it left the game either way.
+        reached = "campaign.new"
+        # Whether the scenario ran its steps to the end. The verdict needs both
+        # this and the log scan below, and the scan is taken after the except
+        # arms, so it cannot be written here.
+        ran = False
         try:
-            bridge.call("campaign.new", {"scenario": name})
+            # The tool rather than the verb. Each scenario is a campaign of
+            # its own, and going straight to the verb left the counters, the
+            # run's recorded save and the zero-progress history describing the
+            # scenario before it -- which is how a sweep gets its second row
+            # refused for a stall that belongs to its first.
+            campaign_new({"scenario": name}, progress)
+            reached = "campaign load"
             _wait_campaign(CAMPAIGN_WAIT, progress)
+            reached = "advance"
             row["advance"] = advance({"days": days, "max_seconds": 120},
                                      progress)
-            scan = _scan_logs(marks)
-            row["newExceptions"] = scan["failures"]
-            # Reported on every row, including the clean ones. An allowlist
-            # that only shows itself when it fired cannot be reviewed, and
-            # this one decides whether a run passes.
-            row["logNoiseIgnored"] = scan["noise"]
-            if scan["capped"]:
-                row["newExceptionsTruncated"] = True
-            row["ok"] = (not row["newExceptions"]
-                         and row["advance"].get("stopReason")
-                         in ("reached", "max_seconds"))
+            ran = True
         except (ToolError, VerbError) as e:
-            row["ok"] = False
             row["error"] = str(e)
+            row["reached"] = reached
+        except BridgeError as e:
+            # Not a verdict on the scenario. Nothing here says the campaign is
+            # bad, only that the run could not be watched to the end, so the
+            # row records it the way advance records the same two failures and
+            # the sweep moves on -- the next scenario relaunches before it
+            # starts. Left uncaught, one dead bridge ended the whole sweep
+            # with an error naming a single scenario.
+            row["stopReason"] = _bridge_stop(e)
+            row["bridgeError"] = str(e)
+            row["reached"] = reached
+            row["next"] = (
+                "the bridge stopped answering during this scenario (%s). The "
+                "sweep relaunches the game before the next one; after the "
+                "last scenario it is left where it ended, so observe reports "
+                "whether the process is still there and game_start brings it "
+                "back." % e)
+        # After the try, so the rows that failed carry the log evidence too.
+        # A scenario that raised or lost the bridge is exactly the row a
+        # reader goes looking for an exception on, and it used to be the one
+        # row with no scan on it at all: what the engine wrote on the way down
+        # was collected by nothing and reported nowhere.
+        scan = _scan_logs(marks)
+        row["newExceptions"] = scan["failures"]
+        # Reported on every row, including the clean ones. An allowlist that
+        # only shows itself when it fired cannot be reviewed, and this one
+        # decides whether a run passes.
+        row["logNoiseIgnored"] = scan["noise"]
+        if scan["capped"]:
+            row["newExceptionsTruncated"] = True
+        row["ok"] = (ran and not row["newExceptions"]
+                     and row["advance"].get("stopReason")
+                     in ("reached", "max_seconds"))
         results.append(row)
     return {"days": days, "ok": all(r.get("ok") for r in results),
             "results": results,
@@ -3107,7 +3760,8 @@ def time_control(args, progress=None):
     force = _flag(args, "force", False)
     out = {}
     if args.get("speed") is not None:
-        out["speed"] = bridge.call("time.speed", {"level": args["speed"]})
+        out["speed"] = bridge.call("time.speed",
+                                   {"level": _speed_arg(args["speed"])})
     if args.get("run_until"):
         # `force` passed through rather than dropped: the DLL refuses a new
         # target while a mission phase is open, and without this argument the
@@ -3132,6 +3786,10 @@ def campaign_new(args, progress=None):
     """
     _require("campaign.new")
     _reset_run()
+    # A campaign with no save behind it. Recorded as such rather than left
+    # alone: whatever the run was playing before is not what a crash here
+    # should reload.
+    _entered_campaign()
     return bridge.call("campaign.new", args)
 
 
@@ -3187,17 +3845,58 @@ def main_menu(args, progress=None):
         % seconds)
 
 
+def save_game(args, progress=None):
+    """Write a named save, and remember that this run is now playing it.
+
+    Thin over the verb; it exists for the record. A save written during a run
+    is the best thing a crash recovery can come back to, and it is the only
+    one the harness itself made -- so a run that saves its own scratch file
+    and then crashes reloads that rather than refusing for lack of an
+    autosave.
+    """
+    name = args.get("name")
+    if not name:
+        raise ToolError("save_game needs name=<save>")
+    out = _require_call("saves.save", {"name": name})
+    _RUN["save"] = {"name": name,
+                    "extension": _extension_of(out)}
+    # The campaign is up and its token is the one this save belongs to. Bound
+    # now rather than left for the next change, which would bind it to the
+    # campaign AFTER this one.
+    _RUN["saveToken"] = _RUN["campaignToken"]
+    return out
+
+
+def _extension_of(saved):
+    """The extension of the file saves.save reports writing, or None.
+
+    The reply carries the full path, and which extension the game appends is
+    a profile setting, so it is read rather than assumed.
+    """
+    path = saved.get("path") if isinstance(saved, dict) else None
+    if not path:
+        return None
+    ext = os.path.splitext(str(path))[1]
+    return ext or None
+
+
 def load_game(args, progress=None):
     name = args.get("name")
     if not name:
         raise ToolError("load_game needs name=<save>%s" % _saves_hint())
+    a = {"name": name}
+    if args.get("extension"):
+        a["extension"] = args["extension"]
     try:
-        data = bridge.call("saves.load", {"name": name})
+        data = bridge.call("saves.load", a)
     except VerbError as e:
         raise ToolError("load failed: %s%s" % (e, _saves_hint()))
     # A different campaign, in the same process: the stall count belonged to
     # the campaign being replaced, and the macro did not.
     _reset_run(keep_macro=True)
+    # What the run is playing, so a crash before the first autosave has
+    # something of this campaign to come back to.
+    _entered_campaign(name, args.get("extension"))
     return {"loading": data, "load": name,
             "next": "the session tears down and reloads (20-60s); poll "
                     "observe until campaign=true"}

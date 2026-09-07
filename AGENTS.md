@@ -50,7 +50,9 @@ enforces it.
   correctly into the game, against a synthetic install in a temporary directory; the
   advance loop's decision helpers; the JSON-RPC read loop; the bridge's failure paths
   and envelope contract; the tool table's annotations; and save discovery. It needs no
-  game and no bridge. `.github/workflows/ci.yml` runs it on every PR.
+  game and no bridge, and a new test module must `import _offline` so the guard that
+  refuses a connection to the bridge port is armed for it too.
+  `.github/workflows/ci.yml` runs it on every PR.
 - An edit to `server/*.py` does not reach a client that already started the
   server. That Python process holds the code it read at launch until the
   client reconnects it, and restarting the game reattaches the same stale one.

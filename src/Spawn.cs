@@ -829,13 +829,25 @@ namespace TerraInvictaMCP
         // branch that sends NaN down the override path into AddDays; and NewArmy
         // stores strength raw. Every one of them lands in campaign state that no
         // later validation can take back out.
+        //
+        // The token type is tested before the value is read, for the same reason
+        // Int() tests it: the explicit cast on a JToken converts rather than
+        // checks. It reads true as 1 and runs Convert.ToSingle over a string, so a
+        // thousands separator or a decimal comma ("1,5") becomes a number nobody
+        // asked for -- and these arguments are the ones that go straight into
+        // campaign state.
         static float Float(JObject args, string key, float fallback)
         {
             JToken t = args != null ? args[key] : null;
             if (t == null || t.Type == JTokenType.Null) return fallback;
-            float value;
-            try { value = (float)t; }
-            catch (Exception) { throw new VerbError("arg '" + key + "' must be a number"); }
+            if (t.Type != JTokenType.Integer && t.Type != JTokenType.Float)
+                throw new VerbError("arg '" + key + "' must be a number, got "
+                    + t.Type);
+            // Right type, wrong size needs no arm of its own: an integer literal too
+            // large for a long is held as a BigInteger, whose conversion saturates
+            // to an infinity rather than throwing, and a float literal past the
+            // range does the same. Both land on the finiteness test below.
+            float value = (float)t;
             if (float.IsNaN(value) || float.IsInfinity(value))
                 throw new VerbError("arg '" + key + "' must be a finite number");
             return value;

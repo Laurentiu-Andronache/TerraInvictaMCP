@@ -79,6 +79,17 @@ namespace TerraInvictaMCP
 
         public static bool Engaged { get { return engaged; } }
 
+        // Whether a colliding mission-phase tick is actually being deferred right
+        // now. Both halves are needed: the deferral is the prefix on
+        // StartNewMissionPhase, and a game update that renames that method leaves
+        // an engagement running with `engaged` true and nothing guarding the
+        // phase. Read by time.run_until, which exempts an engagement from the
+        // open-phase refusal -- an exemption that is only safe while this is true.
+        internal static bool PhaseDeferralActive
+        {
+            get { return engaged && phaseGuardPatched; }
+        }
+
         // The faction the engagement holds, or null. Read by the combat machine, which
         // has to know that this one faction reports isActivePlayer false while the
         // engine's own UI still treats it as the player.

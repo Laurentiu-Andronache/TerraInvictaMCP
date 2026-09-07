@@ -29,7 +29,33 @@ SERVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: E402,F401
+import compose                                      # noqa: E402
 import tools                                        # noqa: E402
+
+
+class OfflineBridge:
+    """A bridge stand-in for the cases that reach a handler.
+
+    handle_call takes a stall reading and a campaign token before it
+    dispatches, both through the bridge module. Without this the case below
+    dials the real port -- and on a machine with the game running it reads
+    that session's clock and can be refused by its pause limit, which is a
+    test that passes or fails on what is on screen somewhere else.
+    """
+
+    def last_stall(self):
+        return None, 0.0
+
+    def last_campaign_token(self):
+        return None
+
+    def last_campaign_process(self):
+        return None
+
+    def call(self, verb, args=None, **kw):
+        raise AssertionError("no bridge call belongs in this test: %s" % verb)
 
 
 def _load_server_main():
@@ -202,7 +228,8 @@ class HandleCallTest(unittest.TestCase):
             return {"ok": True}
 
         with mock.patch.dict(tools.BY_NAME, {"fake_tool": handler}), \
-                mock.patch.dict(tools.READ_ONLY, {"fake_tool": True}):
+                mock.patch.dict(tools.READ_ONLY, {"fake_tool": True}), \
+                mock.patch.object(compose, "bridge", OfflineBridge()):
             tools.handle_call("fake_tool", None)
         self.assertEqual(seen["args"], {})
 

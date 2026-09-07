@@ -27,6 +27,8 @@ SERVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: E402,F401
 import bridge                                       # noqa: E402
 import compose                                      # noqa: E402
 import tools                                        # noqa: E402
@@ -36,7 +38,14 @@ import test_advance                                 # noqa: E402
 LIMIT = 300
 
 
-def _block(seconds, state="paused", since=12, crawl=False):
+def _block(seconds, state="paused", since=None, crawl=False):
+    """One query.time stall block.
+
+    `since` defaults to unknown rather than to a number. The DLL measures it
+    from the verb BEFORE the one being answered, so it is null until a second
+    verb has run and is never a value this file can predict; a case that is
+    about the field passes its own.
+    """
     return {"seconds": seconds, "state": state,
             "sinceLastVerbSeconds": since, "crawl": crawl}
 
@@ -59,9 +68,13 @@ class FakeBridge:
     """The stall cache, the verb the gate refreshes it with, and the queue."""
 
     def __init__(self, seconds, age=0.0, refresh_to=None, raises=None,
-                 state="paused", prompt=None, no_stall_block=False):
+                 state="paused", prompt=None, no_stall_block=False,
+                 since=None):
         self.seconds = seconds
         self.age = age
+        # What the DLL reports as the silence before this call. None is what
+        # it answers until a second verb has run.
+        self.since = since
         # What the refresh reads, when one happens. None means "unchanged".
         self.refresh_to = refresh_to
         self.raises = raises
@@ -72,6 +85,12 @@ class FakeBridge:
 
     def last_stall(self):
         return self.seconds, self.age
+
+    def last_campaign_token(self):
+        return "fake-1"
+
+    def last_campaign_process(self):
+        return "fake"
 
     def call(self, verb, args=None, **kw):
         self.calls.append(verb)
@@ -87,7 +106,7 @@ class FakeBridge:
             self.age = 0.0
             reply = {"date": "2022-01-01", "paused": True}
             if not self.no_stall_block:
-                reply["stall"] = _block(self.seconds, self.state)
+                reply["stall"] = _block(self.seconds, self.state, self.since)
             return reply
         return {}
 
@@ -150,12 +169,63 @@ class PauseDecisionTest(unittest.TestCase):
                      "campaign_new", "save_game"):
             self.assertEqual(self.decide(name), "run", name)
 
-    def test_raw_and_batch_run_but_carry_the_banner(self):
+    def test_the_limit_pair_reads_and_writes_over_a_stopped_clock(self):
+        # The read is the call an agent makes to find out why everything else
+        # is being refused, and the write is the way out of the refusal. Both
+        # have to answer, and the read has to be marked a read or the gate
+        # refuses it.
+        self.assertIs(tools.READ_ONLY["pause_limit"], True)
+        self.assertEqual(
+            self.decide("pause_limit", read_only=True), "banner")
+        self.assertIn("pause_limit", compose.PAUSE_NO_BANNER)
+        self.assertIs(tools.READ_ONLY["set_pause_limit"], False)
+        self.assertEqual(self.decide("set_pause_limit"), "run")
+
+    def test_a_raw_read_runs_with_the_banner(self):
         # Both are general-purpose passes through to anything, so a caller
         # using one has to see what a caller of the tool it stands in for
         # would see.
-        self.assertEqual(self.decide("raw"), "banner")
-        self.assertEqual(self.decide("batch"), "banner")
+        for cmd in ("query.time", "assets.list", "prompts.list", "version",
+                    "saves.list", "combat.status", "mods.list",
+                    "harmony.patches", "ui.screenshot", "ui.tooltip",
+                    "ui.describe",
+                    # No tool of its own, so raw is the only way to read the
+                    # action catalog and this list is the only thing deciding.
+                    "action.list",
+                    # The two that answer with no campaign loaded.
+                    "ping", "verbs"):
+            self.assertEqual(self.decide("raw", args={"cmd": cmd}), "banner",
+                             cmd)
+
+    def test_a_raw_write_is_refused_like_the_tool_it_stands_in_for(self):
+        # The hole this closes is the width of the verb table: every fixture,
+        # every console line and every write refused under its own tool name
+        # went through raw unchanged.
+        for cmd in ("spawn.hab", "console.run", "prompts.dismiss",
+                    "saves.save", "time.pause", "campaign.new"):
+            self.assertEqual(self.decide("raw", args={"cmd": cmd}), "refuse",
+                             cmd)
+
+    def test_a_verb_the_allowlist_does_not_know_is_a_write(self):
+        # A verb added to the DLL after this list was written. Treating an
+        # unknown verb as a read would reopen the hole on every release.
+        self.assertEqual(self.decide("raw", args={"cmd": "future.verb"}),
+                         "refuse")
+
+    def test_a_raw_call_that_names_no_verb_is_refused(self):
+        # It cannot be judged, and over the limit an unjudgeable passthrough
+        # is not given the benefit of the doubt.
+        self.assertEqual(self.decide("raw"), "refuse")
+
+    def test_a_batch_is_read_only_when_every_step_is(self):
+        reads = [{"cmd": "query.time"}, {"cmd": "prompts.list"}]
+        self.assertEqual(self.decide("batch", args={"steps": reads}),
+                         "banner")
+        mixed = reads + [{"cmd": "spawn.hab"}]
+        self.assertEqual(self.decide("batch", args={"steps": mixed}),
+                         "refuse")
+        self.assertEqual(self.decide("batch", args={"steps": []}), "refuse")
+        self.assertEqual(self.decide("batch"), "refuse")
 
     def test_time_runs_except_for_the_two_ways_it_stops_the_clock(self):
         self.assertEqual(self.decide("time", args={"action": "play"}), "run")
@@ -164,6 +234,28 @@ class PauseDecisionTest(unittest.TestCase):
                          "refuse")
         # Speed 0 is a pause by its other name; the DLL treats it as one too.
         self.assertEqual(self.decide("time", args={"speed": 0}), "refuse")
+        # And the wire is JSON: a client that types its arguments loosely
+        # sends the level as a string, which the DLL pauses on all the same.
+        self.assertEqual(self.decide("time", args={"speed": "0"}), "refuse")
+        self.assertEqual(self.decide("time", args={"speed": " 0 "}), "refuse")
+
+    def test_the_forwarded_speed_is_coerced_the_way_the_gate_reads_it(self):
+        # Both sides of the same argument. The gate reads "0" as the pause it
+        # is; without the same coercion on the way out, the call that gets
+        # past the gate is refused by the DLL for its type instead, and the
+        # one call that stops the clock lands on neither side of the limit.
+        self.assertEqual(compose._speed_arg("0"), 0)
+        self.assertEqual(compose._speed_arg(" 5 "), 5)
+        self.assertEqual(compose._speed_arg(5), 5)
+        self.assertEqual(compose._speed_arg(5.0), 5)
+        # Not a whole speed level: left exactly as it came, so the refusal is
+        # the DLL's, which is the side that knows what the levels are.
+        for value in ("fast", 2.5, True, None, [0]):
+            self.assertEqual(compose._speed_arg(value), value)
+        self.assertEqual(self.decide("time", args={"speed": "5"}), "run")
+        # bool is an int in Python, and False would read as speed 0.
+        self.assertEqual(self.decide("time", args={"speed": False}), "run")
+        self.assertEqual(self.decide("time", args={"speed": "fast"}), "run")
 
     def test_a_limit_of_zero_disables_the_guard(self):
         self.assertEqual(self.decide("spawn_hab", stall=9999.0, limit=0),
@@ -224,21 +316,35 @@ class LimitSettingTest(unittest.TestCase):
         self.assertEqual(self.env_limit("five minutes"),
                          compose.PAUSE_LIMIT_SECONDS)
 
-    def test_the_tool_reads_and_sets(self):
+    def test_the_read_tool_reads_and_writes_nothing(self):
         _fresh_session(self)
         report = compose.pause_limit_tool({})
         self.assertEqual(report["limitSeconds"], LIMIT)
-        report = compose.pause_limit_tool({"seconds": 30})
+        # An argument meant for the write reaches a tool that has none, and
+        # the limit is unchanged by it.
+        compose.pause_limit_tool({"seconds": 30})
+        self.assertEqual(compose.pause_limit(), LIMIT)
+
+    def test_the_write_tool_sets_and_records(self):
+        _fresh_session(self)
+        saved = compose._LIMIT["changedAt"]
+        self.addCleanup(compose._LIMIT.__setitem__, "changedAt", saved)
+        report = compose.set_pause_limit_tool({"seconds": 30})
         self.assertEqual(report["limitSeconds"], 30)
         self.assertFalse(report["limitIsDefault"])
         self.assertEqual(compose.pause_limit(), 30)
+        # Recorded, so a run that raised the limit cannot report a clean
+        # sweep without the reading that says it did.
+        self.assertIsNotNone(report["limitChangedAt"])
 
-    def test_the_tool_refuses_nonsense(self):
+    def test_the_write_tool_needs_a_number(self):
         _fresh_session(self)
         with self.assertRaises(compose.ToolError):
-            compose.pause_limit_tool({"seconds": "soon"})
+            compose.set_pause_limit_tool({})
         with self.assertRaises(compose.ToolError):
-            compose.pause_limit_tool({"seconds": -5})
+            compose.set_pause_limit_tool({"seconds": "soon"})
+        with self.assertRaises(compose.ToolError):
+            compose.set_pause_limit_tool({"seconds": -5})
         self.assertEqual(compose.pause_limit(), LIMIT)
 
 
@@ -356,7 +462,7 @@ class PauseGateTest(unittest.TestCase):
         # written once per episode, so that was the diagnosis for the whole
         # stall. The refresh happens before the record, not after it.
         (refusal, _), fake = self.gate("spawn_hab", seconds=412.0, age=1.0,
-                                       state="blocked")
+                                       state="blocked", since=12)
         record = compose._STALL["lastViolation"]
         self.assertEqual(record["state"], "blocked")
         self.assertEqual(record["sinceLastVerbSeconds"], 12)
@@ -390,10 +496,16 @@ class PauseGateTest(unittest.TestCase):
         self.assertEqual(fake.count("query.time"), 1)
 
     def test_raw_takes_one_because_it_carries_the_banner(self):
-        (refusal, banner), fake = self.gate("raw", seconds=412.0, age=1.0)
+        (refusal, banner), fake = self.gate("raw", args={"cmd": "query.time"},
+                                            seconds=412.0, age=1.0)
         self.assertIsNone(refusal)
         self.assertIn("PAUSE LIMIT EXCEEDED", banner)
         self.assertEqual(fake.count("query.time"), 1)
+
+    def test_a_raw_write_is_refused_through_the_gate_too(self):
+        (refusal, _), _ = self.gate("raw", args={"cmd": "spawn.hab"},
+                                    seconds=412.0, age=1.0)
+        self.assertIn("PAUSE LIMIT EXCEEDED", refusal)
 
 
 class EpisodeTest(unittest.TestCase):
@@ -577,11 +689,121 @@ class DispatchTest(unittest.TestCase):
             seen.append((name, read_only))
             return None, None
 
-        with mock.patch.object(compose, "pause_gate", gate):
+        def handler(args, progress=None):
+            return {"ok": True}
+
+        # Both real handlers are stubbed: what handle_call tells the gate is
+        # the whole case, and observe's own answer costs a ping to the bridge
+        # and a full report out of whatever game happens to be running.
+        with mock.patch.object(compose, "pause_gate", gate), \
+                mock.patch.dict(tools.BY_NAME, {"pause_limit": handler,
+                                                "observe": handler}):
             tools.handle_call("pause_limit", {})
             tools.handle_call("observe", {})
         self.assertEqual(seen[0], ("pause_limit", True))
         self.assertEqual(seen[1], ("observe", True))
+
+
+class DeadBridge:
+    """A bridge with a stall cached and nothing behind it any more.
+
+    The reading is fresh and over the limit, which is the state the gate takes
+    a second query.time in -- and that call is the one the game is no longer
+    there to answer. Every verb raises, and the cache clears itself the way
+    bridge.clear_stall does on a failed call.
+    """
+
+    def __init__(self, seconds, age):
+        self.seconds = seconds
+        self.age = age
+        self.calls = []
+
+    def last_stall(self):
+        return self.seconds, self.age
+
+    def last_campaign_token(self):
+        return None
+
+    def last_campaign_process(self):
+        return None
+
+    def verbs(self, refresh=False):
+        raise bridge.BridgeError("connection refused")
+
+    def call(self, verb, args=None, **kw):
+        self.calls.append(verb)
+        # What a real failed call leaves behind: no reading at all.
+        self.seconds, self.age = None, 0.0
+        raise bridge.BridgeError("connection refused")
+
+
+class DeadBridgeTest(unittest.TestCase):
+    """A reading that could not be taken must not refuse or record anything.
+
+    The cached seconds are the last thing the game said before it stopped
+    answering, and the gate used to keep them when the refresh that was meant
+    to replace them failed. So a game that had died mid-stall answered every
+    tool with a stall report -- a violation counted, an episode opened, and a
+    refusal in place of the error that said the bridge was gone.
+    """
+
+    def setUp(self):
+        _fresh_session(self)
+        clean = mock.patch.object(compose.codestate, "stale", return_value="")
+        clean.start()
+        self.addCleanup(clean.stop)
+        # observe asks the OS whether the process is there; the answer is not
+        # what this case is about, and asking costs a pgrep.
+        gone = mock.patch.object(compose, "_process_running",
+                                 return_value=False)
+        gone.start()
+        self.addCleanup(gone.stop)
+
+    def call(self, name, args=None):
+        fake = DeadBridge(412.0, 1.0)
+        # Two patches, because a verb-backed tool reaches the bridge by a
+        # second route: the gate and the campaign note go through
+        # compose.bridge, and tools.call_verb goes through the bridge module
+        # itself, for the verb set and then for the verb. Patching only the
+        # first leaves the write below dialing the real port, where a running
+        # game answers spawn.hab with its own argument error and the case
+        # never sees the dead bridge it is about.
+        dead = bridge.BridgeError("connection refused")
+        with mock.patch.object(compose, "bridge", fake), \
+                mock.patch.object(bridge, "send", side_effect=dead):
+            return tools.handle_call(name, args or {}), fake
+
+    def test_observe_over_a_dead_bridge_opens_no_episode(self):
+        result, fake = self.call("observe")
+        text = result["content"][0]["text"]
+        self.assertNotIn("PAUSE LIMIT EXCEEDED", text)
+        # observe's own answer, which is the one that says what to do next.
+        self.assertIn("game_start", text)
+        self.assertEqual(compose._STALL["stallViolations"], 0)
+        self.assertEqual(compose._STALL["refusedCalls"], 0)
+        self.assertFalse(compose._EPISODE["open"])
+
+    def test_a_write_over_a_dead_bridge_answers_the_bridge(self):
+        # Not a pause refusal: the clock is not what is wrong, and a refusal
+        # naming the stall would send the caller to move a clock in a game
+        # that is not running.
+        result, _ = self.call("spawn_hab", {"body": "Earth"})
+        text = result["content"][0]["text"]
+        self.assertTrue(result["isError"])
+        self.assertNotIn("PAUSE LIMIT EXCEEDED", text)
+        self.assertIn("game is not running or the bridge is down", text)
+        self.assertEqual(compose._STALL["stallViolations"], 0)
+
+    def test_a_bridge_that_is_up_still_refuses_the_write(self):
+        # The control. The same stale cache with a live bridge behind it is a
+        # refusal, so the case above is about the failed refresh and not about
+        # the limit having been switched off.
+        fake = FakeBridge(412.0, age=compose.STALL_CACHE_SECONDS + 1,
+                          refresh_to=412.0)
+        with mock.patch.object(compose, "bridge", fake):
+            result = tools.handle_call("spawn_hab", {"body": "Earth"})
+        self.assertIn("PAUSE LIMIT EXCEEDED", result["content"][0]["text"])
+        self.assertEqual(compose._STALL["stallViolations"], 1)
 
 
 class StalledBridge(test_advance.FakeBridge):

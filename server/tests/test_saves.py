@@ -19,6 +19,8 @@ import os
 import unittest
 from unittest import mock
 
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: F401
 import _fixtures
 from _fixtures import OfflineBridge, modcheck
 import resources

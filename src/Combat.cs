@@ -152,11 +152,37 @@ namespace TerraInvictaMCP
 
             if (!string.IsNullOrEmpty(wanted))
             {
+                // A data name is unique, so a match on one ends the search. A display
+                // name is not: the designer's class-name field refuses a name another
+                // design already holds, but that check lives in the UI, and nothing
+                // enforces it on a design that arrived any other way. Two designs of one
+                // name used to resolve to whichever came first in the faction's list,
+                // which is a design.delete or a spawn.fleet against a design the caller
+                // did not name.
                 for (int i = 0; i < designs.Count; i++)
                 {
                     TISpaceShipTemplate d = designs[i];
                     if (d == null) continue;
-                    if (Same(d.dataName, wanted) || Same(DesignName(d), wanted)) return d;
+                    if (Same(d.dataName, wanted)) return d;
+                }
+
+                var named = new List<TISpaceShipTemplate>();
+                for (int i = 0; i < designs.Count; i++)
+                {
+                    TISpaceShipTemplate d = designs[i];
+                    if (d == null) continue;
+                    if (Same(DesignName(d), wanted)) named.Add(d);
+                }
+                if (named.Count == 1) return named[0];
+                if (named.Count > 1)
+                {
+                    var dataNames = new List<string>();
+                    for (int i = 0; i < named.Count; i++) dataNames.Add(named[i].dataName);
+                    throw new VerbError("faction has " + named.Count + " designs whose "
+                        + "display name is '" + wanted + "': "
+                        + string.Join(", ", dataNames.ToArray())
+                        + ". Name one of those data names; choosing one here would act "
+                        + "on a design that was not asked for");
                 }
                 throw new VerbError("faction has no design named '" + wanted + "'");
             }
@@ -316,7 +342,7 @@ namespace TerraInvictaMCP
             // clock whether or not the speed index changed.
             var manager = PavonisInteractive.TerraInvicta.Systems.GameTime.GameTimeManager.Singleton;
             o["blocked"] = manager != null ? Blocked(manager) : JValue.CreateNull();
-            o["autoresolve"] = AutoresolveStatus();
+            o["autoresolve"] = AutoresolveStatus(active);
             return o;
         }
 
@@ -793,7 +819,7 @@ namespace TerraInvictaMCP
                 autoPhase = Simulated(combat) ? AutoPhase.Simulating : AutoPhase.Settling;
                 Reached(autoPhase);
             }
-            return AutoresolveStatus();
+            return AutoresolveStatus(combat);
         }
 
         // Whether arming again on this combat is allowed at all.
@@ -808,9 +834,25 @@ namespace TerraInvictaMCP
         // the refusals here come before anything else the arm would do.
         static void RefuseUnsafeRearm(TISpaceCombatState combat)
         {
-            if (autoHistoryCombatId != (int)combat.ID) return;
+            string refusal = UnsafeRearmReason((int)combat.ID);
+            if (refusal != null) throw new VerbError(refusal);
+        }
 
-            string what = "combat " + (int)combat.ID + " reached phase "
+        // The refusal itself, as a string rather than a throw, so the reported
+        // `retryable` is the very decision the arm makes instead of a second copy of
+        // it. Written twice, the two disagreed twice: on the attempt budget, which
+        // only counts against a combat that recorded an error, and on scope, since
+        // the record refuses arms on the combat it names and on no other. Null means
+        // an arm is allowed.
+        //
+        // Keyed on the id, because a caller holding the combat state and a status
+        // reply describing a combat that may already be archived and removed both
+        // need the same answer.
+        static string UnsafeRearmReason(int combatId)
+        {
+            if (autoHistoryCombatId < 0 || autoHistoryCombatId != combatId) return null;
+
+            string what = "combat " + combatId + " reached phase "
                 + autoReached.ToString().ToLowerInvariant()
                 + (autoError != null ? " and failed with: " + autoError : "");
 
@@ -821,29 +863,29 @@ namespace TerraInvictaMCP
             // fires -- and a message promising they are there would send an unattended
             // run to a dead end twice.
             if (autoFiredAccept)
-                throw new VerbError(what + ". OnAcceptAutoresolveSelected has already "
+                return what + ". OnAcceptAutoresolveSelected has already "
                     + "fired on it, and that reaches ApplySimulatedCombat, which writes "
                     + "damage into the real states -- arming again would apply the same "
                     + "battle twice. Inspect with combat.status, and with "
                     + "combat.precombat action=status, which reports whether the canvas "
                     + "is up and which of its buttons are live; if none are, nothing "
-                    + "here can clear the screen and it needs a person");
+                    + "here can clear the screen and it needs a person";
             if (autoFiredSelect)
-                throw new VerbError(what + ". AutoresolveSelected has already fired on "
+                return what + ". AutoresolveSelected has already fired on "
                     + "it, raising PrecombatComplete, and arming again would raise a "
                     + "second one. Inspect with combat.status, and with "
                     + "combat.precombat action=status, which reports whether the canvas "
                     + "is up and which of its buttons are live; if none are, nothing "
-                    + "here can clear the screen and it needs a person");
+                    + "here can clear the screen and it needs a person";
             if (autoErrorKind == AutoFail.Stable)
-                throw new VerbError(what + ". Nothing a retry does changes that "
-                    + "condition, so this is not armed again");
+                return what + ". Nothing a retry does changes that "
+                    + "condition, so this is not armed again";
             if (autoErrorKind == AutoFail.DeadEnd)
-                throw new VerbError(what + ". The combat is gone and the precombat "
+                return what + ". The combat is gone and the precombat "
                     + "canvas is still up holding the clock; no arm reaches it. The "
                     + "close pass already tried both close buttons every frame of its "
                     + "budget, so check combat.precombat action=status for a live "
-                    + "button before assuming one is there");
+                    + "button before assuming one is there";
             // Gated on a recorded error: attempts alone are not failures. A combat
             // both sides of which turned out to be AI disarms cleanly with a note and
             // no error, and re-arming on it is harmless.
@@ -853,8 +895,9 @@ namespace TerraInvictaMCP
             // one message, and a same-text test would let the alternating pair run
             // forever.
             if (autoAttempts >= MaxAutoresolveAttempts && autoError != null)
-                throw new VerbError(what + ", over " + autoAttempts + " attempts. That "
-                    + "is the retry budget, so this is not armed again");
+                return what + ", over " + autoAttempts + " attempts. That "
+                    + "is the retry budget, so this is not armed again";
+            return null;
         }
 
         // Records the furthest phase this combat's machine has entered. Called on every
@@ -918,7 +961,11 @@ namespace TerraInvictaMCP
             return null;
         }
 
-        static JToken AutoresolveStatus()
+        // `combat` is the fight the surrounding reply is about, and the arming
+        // decision below is answered for it. With none in view -- combat.status with
+        // nothing active -- the answer is about the combat the record names, which is
+        // the one `attemptedCombat` reports beside it.
+        static JToken AutoresolveStatus(TISpaceCombatState combat)
         {
             var o = new JObject();
             o["armed"] = autoPhase != AutoPhase.Idle;
@@ -936,7 +983,7 @@ namespace TerraInvictaMCP
             o["attempts"] = autoAttempts;
             o["reached"] = autoReached.ToString().ToLowerInvariant();
             o["errorKind"] = autoErrorKind.ToString().ToLowerInvariant();
-            o["retryable"] = Retryable();
+            o["retryable"] = Retryable(combat);
             o["firedAutoresolveSelected"] = autoFiredSelect;
             o["firedAcceptAutoresolve"] = autoFiredAccept;
             // The engine's promotion gate as it read when this combat was armed. It
@@ -952,16 +999,12 @@ namespace TerraInvictaMCP
             return o;
         }
 
-        // Whether another arm on the recorded combat would be accepted. Answered from
-        // the same fields RefuseUnsafeRearm reads, so the report cannot disagree with
-        // the decision.
-        static bool Retryable()
+        // Whether another arm would be accepted, from the predicate the arm itself
+        // refuses on, so the report cannot disagree with the decision.
+        static bool Retryable(TISpaceCombatState combat)
         {
-            if (autoHistoryCombatId < 0) return true;
-            if (autoFiredSelect || autoFiredAccept) return false;
-            if (autoErrorKind == AutoFail.Stable) return false;
-            if (autoErrorKind == AutoFail.DeadEnd) return false;
-            return autoAttempts < MaxAutoresolveAttempts;
+            int id = combat != null ? (int)combat.ID : autoHistoryCombatId;
+            return UnsafeRearmReason(id) == null;
         }
 
         // Clears the working machine only. The history above is deliberately left
@@ -974,6 +1017,25 @@ namespace TerraInvictaMCP
             autoFrames = 0;
             autoStance = -1;
             autoPrecombat = null;
+        }
+
+        // Forgets the record of what the last arm on a combat left behind. Disarm
+        // leaves it standing on purpose, because the arming decision that follows a
+        // failed tick is exactly the thing that needs it; a campaign transition is the
+        // other case, where the combat it names is about to stop existing and the id
+        // is handed straight back out to whatever the next campaign allocates first.
+        //
+        // Called from saves.load, campaign.new and game.main_menu. Those three calls
+        // collapse into the one campaign reset that clears the run state beside them.
+        static void ResetHistory()
+        {
+            autoHistoryCombatId = -1;
+            autoHistoryGate = null;
+            autoReached = AutoPhase.Idle;
+            autoErrorKind = AutoFail.Unknown;
+            autoAttempts = 0;
+            autoFiredSelect = false;
+            autoFiredAccept = false;
         }
 
         // Optional client stance override: {"stance": "Pursue"}. Validated against the
@@ -1462,12 +1524,13 @@ namespace TerraInvictaMCP
             var o = new JObject();
             o["canvasUp"] = CanvasUp(precombat);
             o["buttons"] = PrecombatButtons(precombat);
-            o["combat"] = Safe<JToken>(delegate
-            {
-                TISpaceCombatState combat = precombat.combat;
-                return combat != null ? Describe(combat) : JValue.CreateNull();
-            }, JValue.CreateNull());
-            o["autoresolve"] = AutoresolveStatus();
+            TISpaceCombatState onScreen = Safe<TISpaceCombatState>(
+                delegate { return precombat.combat; }, null);
+            o["combat"] = onScreen != null
+                ? Safe<JToken>(delegate { return Describe(onScreen); },
+                               JValue.CreateNull())
+                : (JToken)JValue.CreateNull();
+            o["autoresolve"] = AutoresolveStatus(onScreen);
             if (action == "status") return o;
 
             if (precombat == null) throw new VerbError("no precombat controller");
@@ -1602,6 +1665,19 @@ namespace TerraInvictaMCP
                 throw new VerbError("no precombat controller, so there is no screen to "
                     + "submit a stance on; combat.status reports whether a combat is "
                     + "pending at all");
+
+            // The same gate combat.precombat and the prompt answer take, and for the
+            // same reason: the controller survives the screen, so with the canvas
+            // down it still holds a combat -- the finished one whose report was just
+            // closed, or a stale one while OnCombatInitiated defers the next -- and
+            // StanceSubmit would run on that, on behalf of a screen the player never
+            // saw. The stance prompt that freezes the clock is answered from a canvas
+            // that is up.
+            if (!CanvasUp(precombat))
+                throw new VerbError("the precombat canvas is not up, so the stance "
+                    + "button does not exist to press; nothing was submitted. "
+                    + "combat.precombat action=status reports the canvas and its "
+                    + "buttons, and combat.status what is pending");
 
             // Two drivers on one screen. The machine's own SettleStep submits this
             // same stance a step per frame, and a second submit races it into a

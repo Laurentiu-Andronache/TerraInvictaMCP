@@ -901,13 +901,12 @@ namespace TerraInvictaMCP
                     + "'module.benefits'); pass 'hab' alone to list a hab's "
                     + "modules and their ids");
             }
-            // A numeric string is still an id and is taken, the way every other
-            // id argument takes one; a data name is the mistake this catches,
-            // and it is caught before Int() can report it as a bad integer.
-            int parsed;
-            if (moduleArg.Type != JTokenType.Integer
-                && !int.TryParse(moduleArg.ToString().Trim(), NumberStyles.Integer,
-                    CultureInfo.InvariantCulture, out parsed))
+            // A data name is the mistake this catches, and it is caught here so the
+            // answer names the other kind rather than leaving Int() to report a bad
+            // integer. Every non-integer token is caught, a numeric string
+            // included: Int() refuses one on the next line, so accepting it here
+            // only moved the refusal.
+            if (moduleArg.Type != JTokenType.Integer)
                 throw new VerbError("kind 'module.summary' takes arg 'module' as a "
                     + "TIHabModuleState id and got '" + moduleArg.ToString()
                     + "'; a template dataName is kind 'module.benefits'"
@@ -1281,11 +1280,28 @@ namespace TerraInvictaMCP
                 throw new VerbError("'rename' presses the habitats screen's rename "
                     + "button, and show='" + show + "' resolves to " + type.Name
                     + ", which has none. Nothing was changed");
+            // The remaining rename refusals run ahead of the screen change as
+            // well, so every refusal on this path leaves the screen as it found
+            // it, which is what "nothing was changed" claims. Reading the selected
+            // hab this early reads the same hab the press would have got:
+            // ShowInfoScreen<T> returns at once when T is already the active info
+            // screen (IL_0000-IL_001d), and when it is not, Show() runs
+            // SetEmptyHabView (Show IL_014d), which clears habToDisplay to the
+            // null this refuses on either way.
+            HabitatsScreenController habs = null;
+            TIHabState selected = null;
+            if (rename)
+            {
+                habs = HabitatsController(stack);
+                selected = Safe<TIHabState>(
+                    delegate { return habs.habToDisplay; }, null);
+                RefuseUnrenameableHabOnHabitats(selected);
+            }
             ShowScreen(stack, type);
             o["activeInfoScreen"] = NameOrNull(ActiveInfoScreenName(stack));
             o["shown"] = string.Equals(ActiveInfoScreenName(stack), type.Name,
                                        StringComparison.Ordinal);
-            if (rename) RenameOnHabitats(stack, o);
+            if (rename) PressRenameOnHabitats(habs, selected, o);
             return o;
         }
 
@@ -1466,10 +1482,19 @@ namespace TerraInvictaMCP
             JObject o)
         {
             HabitatsScreenController habs = HabitatsController(stack);
-            o["renamePanel"] = "HabitatsScreenController.renameMyHabPanel";
             TIHabState shown = Safe<TIHabState>(
                 delegate { return habs.habToDisplay; }, null);
             RefuseUnrenameableHabOnHabitats(shown);
+            PressRenameOnHabitats(habs, shown, o);
+        }
+
+        // The press alone, over a controller and a hab already read and already
+        // through RefuseUnrenameableHabOnHabitats. Separate so the show path can
+        // run both refusals before it changes what is on screen.
+        static void PressRenameOnHabitats(HabitatsScreenController habs,
+            TIHabState shown, JObject o)
+        {
+            o["renamePanel"] = "HabitatsScreenController.renameMyHabPanel";
             try { habs.OnClickRename(); }
             catch (Exception e)
             {

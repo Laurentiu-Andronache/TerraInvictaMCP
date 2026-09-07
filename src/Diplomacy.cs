@@ -851,10 +851,18 @@ namespace TerraInvictaMCP
             if (wanted == null || wanted.Type == JTokenType.Null)
                 return RelationsPair(subject, target);
 
+            // Token type first, the way Int() and Float() test theirs: the explicit
+            // cast on a JToken is a conversion, so true would become 1.0 and
+            // Convert.ToSingle would read "1,5" as some number of its own. Hate is
+            // written straight into the faction pair's table.
+            if (wanted.Type != JTokenType.Integer && wanted.Type != JTokenType.Float)
+                throw new VerbError("arg 'hate' must be a number, got "
+                    + wanted.Type + "; nothing was changed");
             float value;
             try { value = (float)wanted; }
             catch (Exception)
-            { throw new VerbError("arg 'hate' must be a number"); }
+            { throw new VerbError("arg 'hate' is out of range for a number; "
+                + "nothing was changed"); }
             // A non-finite value would land in the faction's hate dictionary and
             // poison every later comparison against it, including the two
             // thresholds the mood and the war checks read.

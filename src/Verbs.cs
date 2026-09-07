@@ -240,7 +240,11 @@ namespace TerraInvictaMCP
             long id = req != null ? req.id : 0;
             // Main thread, inside Server.Drain. Recorded before the verb runs
             // rather than after, so a verb that takes a while does not read as
-            // a client that went quiet.
+            // a client that went quiet. The stamp it replaces is kept: a reply
+            // built INSIDE a verb has to answer how long the client was away
+            // before this call, and the current stamp is this call itself.
+            prevVerbAt = lastVerbAt;
+            prevVerbKnown = lastVerbKnown;
             lastVerbAt = RealTime();
             lastVerbKnown = true;
             try
@@ -287,6 +291,12 @@ namespace TerraInvictaMCP
             // exactly where it would otherwise learn nothing. Response fields
             // may grow, so a client that does not know the key ignores it.
             o["clockStall"] = Stall();
+            // Beside it for the same reason: a client that never asks the right
+            // verb at the right moment would otherwise miss a campaign swap it
+            // did not order, and every counter it keeps would describe a
+            // campaign that is gone.
+            o["campaignToken"] = CampaignTokenValue();
+            o["campaignProcess"] = CampaignProcessValue();
             o["data"] = data != null ? data : JValue.CreateNull();
             return o.ToString(Formatting.None);
         }
@@ -297,6 +307,8 @@ namespace TerraInvictaMCP
             o["id"] = id;
             o["ok"] = false;
             o["clockStall"] = Stall();
+            o["campaignToken"] = CampaignTokenValue();
+            o["campaignProcess"] = CampaignProcessValue();
             o["error"] = string.IsNullOrEmpty(message) ? "error" : message;
             return o.ToString(Formatting.None);
         }
@@ -536,6 +548,10 @@ namespace TerraInvictaMCP
             // that goes with them -- how long since anything called, and which
             // of the four ways the clock can be still this one is.
             o["stall"] = StallBlock(manager);
+            // The same token the envelope carries, on the reply a driver already
+            // reads every poll. Null between campaigns.
+            o["campaignToken"] = CampaignTokenValue();
+            o["campaignProcess"] = CampaignProcessValue();
             return o;
         }
 
@@ -1526,6 +1542,42 @@ namespace TerraInvictaMCP
         static bool clockParkedByDriver;
         internal static bool ClockParkedByDriver { get { return clockParkedByDriver; } }
 
+        // Everything this mod holds ABOUT a campaign, cleared in one place.
+        //
+        // All of it names something that belongs to one campaign: a date to stop
+        // at, a park the driver asked for, an armed autoresolve and the record of
+        // the last one, a count of mission-phase collisions. None of it means
+        // anything against the next campaign, and two pieces are worse than
+        // meaningless: GameStateManager.ClearAllGameStates restarts the state-id
+        // allocator, so the next campaign in this process hands out the same ids
+        // in the same order, and an armed machine or a one-shot record would bind
+        // to whatever inherits the id.
+        //
+        // Not the seat. Its lifecycle is already handled on both transitions:
+        // LatchSeat runs on the first frame a campaign is up, and ForgetSeat sets
+        // seatTeardown, which only the no-campaign branch of the watchdog clears.
+        // A reset that also called ForgetSeat would leave seatTeardown set for the
+        // whole campaign, and LatchSeat refuses while a teardown is pending, so
+        // the seat would never latch and the seat-moved refusal would never fire.
+        //
+        // The watchdog calls this when a campaign goes away, so the in-game
+        // Options > Exit path -- which runs through no verb and no hook -- resets
+        // exactly what a verb-driven exit resets. Every teardown passes that
+        // branch, which is why nothing has to be reset again when the next
+        // campaign comes up. The three verbs call it because they act a frame or
+        // more before the transition the watchdog sees.
+        internal static void ResetCampaignRunState()
+        {
+            runUntilTarget = null;
+            runUntilText = null;
+            clockParkedByDriver = false;
+            Disarm();
+            autoError = null;
+            autoNote = null;
+            ResetHistory();
+            AiControl.ResetMissionPhaseCollisions();
+        }
+
         static JToken TimeRunUntil(JObject args)
         {
             string text = Str(args, "date");
@@ -1566,7 +1618,15 @@ namespace TerraInvictaMCP
             // the stale list ends the next phase early. Close the phase first
             // (prompts.dismiss presses the assignment confirmation), or say
             // force=true and own the outcome.
-            if (PhaseIsActive(phase) && !Flag(args, "force"))
+            //
+            // An engagement that is deferring colliding ticks is exempt, and only
+            // while it is: the collision cannot happen, and a driver reading the
+            // engagement skips its own hold, so a refusal here would leave that
+            // run with the clock down and nothing that ever re-arms it. The
+            // deferral needs the StartNewMissionPhase prefix installed, which is
+            // why the test is not `engaged` alone.
+            if (PhaseIsActive(phase) && !Flag(args, "force")
+                && !AiControl.PhaseDeferralActive)
                 throw new VerbError("mission_phase: a mission phase is open "
                     + "(missionPhase " + phase.ToString(Formatting.None) + "), and arming a "
                     + "new run_until target hands the clock back into it. Close the phase "
@@ -1650,6 +1710,26 @@ namespace TerraInvictaMCP
         static bool clockStallKnown;
         static bool clockCrawling;
         static bool hadCampaign;
+
+        // A name for the campaign currently loaded, null when there is none.
+        //
+        // Nothing in the engine can supply one. GameStateManager.ClearAllGameStates
+        // restarts the id allocator, so a second campaign of the same scenario in
+        // one process hands out the same state ids in the same order and every id
+        // a client could key on repeats. The date repeats too. So the token is
+        // minted here: a counter bumped on each transition into a campaign, behind
+        // a prefix taken once at mod load, which is what keeps two runs of the same
+        // scenario in two processes from both answering "1".
+        //
+        // A client compares it with the last one it saw. Different means the
+        // campaign it was measuring is gone, whether or not a verb was involved --
+        // the in-game Options > Exit and a campaign started from the start screen
+        // both land here through the watchdog.
+        static readonly string campaignTokenPrefix =
+            DateTime.UtcNow.Ticks.ToString("x", CultureInfo.InvariantCulture);
+        static int campaignCount;
+        static string campaignToken;
+
         // Which faction held the active-player seat when this campaign came up,
         // and whether anything has been latched yet.
         //
@@ -1671,6 +1751,12 @@ namespace TerraInvictaMCP
         static bool seatTeardown;
         static float lastVerbAt;
         static bool lastVerbKnown;
+        // The stamp of the verb before the one being served. The watchdog's tick
+        // wants the latest one -- it runs between calls, and the last verb is the
+        // last verb. A reply wants this one, because the latest is the call being
+        // answered and would report every silence as zero.
+        static float prevVerbAt;
+        static bool prevVerbKnown;
         static float lastRealTime;
         // Whole five-minute marks of the CURRENT stall already logged; reset
         // when the clock recovers, so each stall gets its own lines.
@@ -1831,8 +1917,17 @@ namespace TerraInvictaMCP
             catch (Exception) { return; }
             if (!campaign)
             {
+                // The transition out, taken once. This branch runs every frame the
+                // start screen is up, and the reset below is not free; it is also
+                // the only notice this mod gets of the in-game Options > Exit,
+                // which goes through no verb and no hook of ours.
+                if (hadCampaign)
+                {
+                    hadCampaign = false;
+                    campaignToken = null;
+                    ResetCampaignRunState();
+                }
                 // Nothing to measure between campaigns.
-                hadCampaign = false;
                 clockKeyKnown = false;
                 clockStallKnown = false;
                 clockStallSeconds = 0f;
@@ -1864,6 +1959,21 @@ namespace TerraInvictaMCP
                 // reloaded to the date it was saved at would inherit the stall
                 // of the campaign it replaced.
                 hadCampaign = true;
+                // The campaign this process is now in. Bumped here rather than in
+                // the verbs, so a campaign started from the start screen by hand
+                // gets a token of its own like any other.
+                campaignCount++;
+                campaignToken = campaignTokenPrefix + "-"
+                    + campaignCount.ToString(CultureInfo.InvariantCulture);
+                // No reset here. Everything a campaign leaves behind is cleared on
+                // the way OUT, in the branch above, which every teardown passes
+                // through -- the in-game Options > Exit included, since
+                // loadcycle100 goes false before the next campaign is up. Resetting
+                // on the way IN would instead discard what a driver armed in this
+                // same frame: OnUpdate drains the request queue before it calls
+                // this tick, so a client that read `campaign: true` and armed
+                // time.run_until in that window was answered `armed: true` and then
+                // had the target nulled a few microseconds later.
                 clockKeyKnown = false;
                 stallWarnMarks = 0;
                 clockMovedAt = now;
@@ -1986,14 +2096,44 @@ namespace TerraInvictaMCP
             return new JValue(Math.Round((double)clockStallSeconds, 1));
         }
 
+        // The campaign token as a JSON value: a string while a campaign is loaded,
+        // null between campaigns. One static read, no Unity API, so it costs an
+        // envelope nothing and is safe on whichever thread builds the reply.
+        static JToken CampaignTokenValue()
+        {
+            string token = campaignToken;
+            return token != null ? (JToken)new JValue(token) : JValue.CreateNull();
+        }
+
+        // The token's prefix on a key of its own: a name for the process answering,
+        // taken once at mod load and never written again, so it is a string on
+        // every reply including the ones sent between campaigns.
+        //
+        // The token alone cannot say which process minted it. The counter behind
+        // the prefix restarts at 1 in every process, so a client that kept a
+        // campaign token across a game it did not replace -- a person relaunching
+        // at the console -- can be handed "<other prefix>-1" for a campaign it
+        // never ordered and take it for the one it did. Comparing this key is how
+        // a client tells a new campaign from a new game.
+        static JToken CampaignProcessValue()
+        {
+            return new JValue(campaignTokenPrefix);
+        }
+
         // {seconds, sinceLastVerbSeconds, state, crawl} for query.time.
+        //
+        // The silence is measured from the PREVIOUS verb. This block is built
+        // inside a verb, so the current stamp is the call being answered and the
+        // key would read 0.0 on every reply -- which is the one value that means
+        // "a client is calling constantly", the opposite of what a client asking
+        // after a quiet stretch is being told. Null until a second verb runs.
         static JToken StallBlock(GameTimeManager manager)
         {
             float now = RealTime();
             var o = new JObject();
             o["seconds"] = Stall();
-            o["sinceLastVerbSeconds"] = lastVerbKnown
-                ? (JToken)new JValue(Math.Round((double)(now - lastVerbAt), 1))
+            o["sinceLastVerbSeconds"] = prevVerbKnown
+                ? (JToken)new JValue(Math.Round((double)(now - prevVerbAt), 1))
                 : JValue.CreateNull();
             o["state"] = clockStallKnown
                 ? (JToken)new JValue(ClockStateName(manager, now))
@@ -2068,7 +2208,7 @@ namespace TerraInvictaMCP
         static JToken SavesLoad(JObject args)
         {
             string name = SaveName(args);
-            string path = ExistingSavePath(name);
+            string path = ExistingSavePath(name, Str(args, "extension"));
             if (path == null) throw new VerbError("no save named '" + name + "'");
 
             // No Singleton on this controller; the component lives on the pause menu
@@ -2083,17 +2223,10 @@ namespace TerraInvictaMCP
             // Anything armed against the outgoing campaign must not act on the incoming
             // one. State ids are reused across campaigns, so an armed autoresolve would
             // happily bind whatever combat inherits the id and start submitting stances.
-            runUntilTarget = null;
-            runUntilText = null;
-            clockParkedByDriver = false;
-            Disarm();
-            autoError = null;
-            autoNote = null;
-            // Same reason: the collision count describes the campaign being
-            // replaced, and query.time would otherwise report it against the
-            // incoming one.
-            AiControl.ResetMissionPhaseCollisions();
-            // And the seat: the save names its own active player, which need not
+            // Done here as well as from the watchdog's transition, because this verb
+            // acts a frame or more before the engine reports the campaign gone.
+            ResetCampaignRunState();
+            // The seat: the save names its own active player, which need not
             // be the faction seated in the campaign this replaces. Cleared here
             // rather than re-read, because the load is asynchronous and the seat
             // is not the new one yet; the tick latches it once the campaign is up.
@@ -2180,8 +2313,35 @@ namespace TerraInvictaMCP
         }
 
         // The configured extension depends on a profile setting, so both are tried.
-        static string ExistingSavePath(string name)
+        //
+        // `extension` names which one, for the case the search cannot decide: both
+        // twins of a stem on disk, the caller holding the mtime of one of them. It
+        // has to be an argument of its own, because the name cannot carry it --
+        // GetSaveFilePath APPENDS the profile's extension to whatever it is given,
+        // so "Autosave.json" resolves to "Autosave.json.gz" and exists nowhere.
+        // Refused unless it is one the game writes, since it reaches a file path.
+        static string ExistingSavePath(string name, string extension)
         {
+            if (!string.IsNullOrEmpty(extension))
+            {
+                string want = extension.StartsWith(".") ? extension : "." + extension;
+                bool known = false;
+                for (int i = 0; i < SaveExtensions.Length; i++)
+                {
+                    if (string.Equals(want, SaveExtensions[i],
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        want = SaveExtensions[i];
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known)
+                    throw new VerbError("arg 'extension' must be one of "
+                        + string.Join(", ", SaveExtensions) + ", not '" + extension + "'");
+                string exact = Path.Combine(SaveFolder(), name + want);
+                return File.Exists(exact) ? exact : null;
+            }
             string preferred = TIUtilities.GetSaveFilePath(name);
             if (File.Exists(preferred)) return preferred;
             string folder = SaveFolder();
@@ -2254,8 +2414,7 @@ namespace TerraInvictaMCP
         {
             JToken t = args != null ? args[key] : null;
             if (t == null || t.Type == JTokenType.Null) throw new VerbError("missing arg '" + key + "'");
-            try { return (int)t; }
-            catch (Exception) { throw new VerbError("arg '" + key + "' must be an integer"); }
+            return WholeNumber(t, key);
         }
 
         // Filter args are absent far more often than not; -1 means "no filter", and
@@ -2264,8 +2423,31 @@ namespace TerraInvictaMCP
         {
             JToken t = args != null ? args[key] : null;
             if (t == null || t.Type == JTokenType.Null) return -1;
+            return WholeNumber(t, key);
+        }
+
+        // The token type is tested before the value is read. JSON.NET's explicit
+        // cast is a conversion rather than a check, and it accepts the string and
+        // boolean token types as numbers: it hands the value to Convert.ToInt32,
+        // which rounds 2.5 to 2, answers 1 for true, and reads the string "12" as
+        // twelve. A slot, an id or a tier invented that way is a wrong call that
+        // reads as a right one, and from the fixture verbs it lands in campaign
+        // state. A caller who means a number sends a number: the tool schemas
+        // declare integer, and a hand-written raw call gets the type it sent named
+        // back to it.
+        static int WholeNumber(JToken t, string key)
+        {
+            if (t.Type != JTokenType.Integer)
+                throw new VerbError("arg '" + key + "' must be an integer, got "
+                    + t.Type);
+            // Right type, wrong size: JSON.NET holds an integer literal too large
+            // for a long as a BigInteger, and the conversion throws on it.
             try { return (int)t; }
-            catch (Exception) { throw new VerbError("arg '" + key + "' must be an integer"); }
+            catch (Exception)
+            {
+                throw new VerbError("arg '" + key + "' is out of range for a "
+                    + "32-bit integer");
+            }
         }
 
         #region Shared helpers

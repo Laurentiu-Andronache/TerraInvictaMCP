@@ -88,13 +88,27 @@ namespace TerraInvictaMCP
             var hullWeapons = ParseEntries(args, "hull_weapons");
             var fireModes = ParseFireModes(args, "fire_modes");
 
+            // Only when the design is going to be registered. The list is about
+            // names in use, and nothing that is not saved takes a name: under
+            // save=false the verb builds the design, runs the checks and throws it
+            // away, which is how a caller asks whether a loadout validates. That
+            // question has no answer at all if the name it was asked under is the
+            // name of a design or a ship already in play.
+            if (save) RefuseTakenClassName(name);
+
             // Refused before anything is built rather than after: the hull is what
             // TrySetArmor dereferences, and the message is more use than an engine
             // NullReferenceException with the same cause.
-            if (TemplateManager.Find<TIShipHullTemplate>(hull, false) == null)
+            TIShipHullTemplate hullTemplate =
+                TemplateManager.Find<TIShipHullTemplate>(hull, false);
+            if (hullTemplate == null)
                 throw new VerbError("no TIShipHullTemplate named '" + hull
                     + "'; the design's armor clamp reads the hull and would throw. "
                     + "Nothing was created");
+
+            // Needs the hull, so it runs here rather than beside the entry
+            // parsing it belongs to.
+            RefuseSlotCollisions(hullTemplate, modules, noseWeapons, hullWeapons);
 
             string dataName = Safe<string>(delegate
             {
@@ -541,19 +555,7 @@ namespace TerraInvictaMCP
             if (string.Equals(entry.moduleName, "Empty", StringComparison.Ordinal))
                 return "\"Empty\" is the engine's own marker for an unused slot, "
                     + "so the entry is skipped by name";
-            TIShipPartTemplate part = null;
-            if (weapon)
-                part = Safe<TIShipWeaponTemplate>(delegate
-                {
-                    return TemplateManager.Find<TIShipWeaponTemplate>(
-                        entry.moduleName, true);
-                }, null);
-            else
-                part = Safe<TIShipModuleTemplate>(delegate
-                {
-                    return TemplateManager.Find<TIShipModuleTemplate>(
-                        entry.moduleName, true);
-                }, null);
+            TIShipPartTemplate part = ResolvePart(entry.moduleName, weapon);
             if (part == null)
                 return "no " + kind + " named '" + entry.moduleName + "', which is "
                     + "the lookup " + getter + " makes";
@@ -642,6 +644,217 @@ namespace TerraInvictaMCP
                 List<TISpaceShipTemplate> designs = faction.shipDesigns;
                 return designs != null && designs.Contains(design);
             }, false);
+        }
+
+        // The lookup each of the engine's three part getters makes: a module
+        // entry through TIShipModuleTemplate, a weapon entry through
+        // TIShipWeaponTemplate. That choice is the only difference between
+        // them, so `weapon` picks it and nothing else.
+        static TIShipPartTemplate ResolvePart(string name, bool weapon)
+        {
+            if (weapon)
+                return Safe<TIShipWeaponTemplate>(delegate
+                {
+                    return TemplateManager.Find<TIShipWeaponTemplate>(name, true);
+                }, null);
+            return Safe<TIShipModuleTemplate>(delegate
+            {
+                return TemplateManager.Find<TIShipModuleTemplate>(name, true);
+            }, null);
+        }
+
+        // The gate the ship designer's own class-name field runs. It trims the
+        // text, then asks TISpaceShipTemplate.illegalShipClassNames whether it
+        // holds it (OnDesignerClassNameChanged IL_000b-IL_001c). That is
+        // List<string>.Contains, so the comparison is ordinal and
+        // case-sensitive. The list is stored nowhere: its getter rebuilds it on
+        // every access from the display name of every ship template
+        // TemplateManager holds (IL_0006-IL_002d) followed by the display name
+        // of every ship state that is not archived (IL_003b-IL_006d). So a
+        // fixture ship named Testbed blocks a design named Testbed even though
+        // no design carries the name, and a design that saved under a taken
+        // name would be one the designer screen refuses to let a player make.
+        //
+        // `name` arrives trimmed from RequiredText, which is the same text the
+        // name field passes.
+        static void RefuseTakenClassName(string name)
+        {
+            List<string> taken = Safe<List<string>>(delegate
+            {
+                return TISpaceShipTemplate.illegalShipClassNames;
+            }, null);
+            if (taken == null) return;
+            if (!Safe<bool>(delegate { return taken.Contains(name); }, false))
+                return;
+
+            string holder = DesignWithClassName(name);
+            if (holder != null)
+                throw new VerbError("class name '" + name + "' is already the "
+                    + "display name of design '" + holder + "', which is what "
+                    + "the engine's illegalShipClassNames refuses. Pick another "
+                    + "name, or free this one with design.delete. Nothing was "
+                    + "created");
+            throw new VerbError("class name '" + name + "' is in the engine's "
+                + "illegalShipClassNames and no design holds it, so a ship in "
+                + "play carries this class name: the list takes the display "
+                + "name of every ship state that is not archived as well as "
+                + "every design's. Pick another name, or take that ship out of "
+                + "the campaign. Nothing was created");
+        }
+
+        // Which design holds the name, for the refusal above. Walked over
+        // TemplateManager rather than one faction's designs, the way the list
+        // itself is built: illegalShipClassNames is global, so the design that
+        // blocks a name is often another faction's.
+        static string DesignWithClassName(string name)
+        {
+            return Safe<string>(delegate
+            {
+                foreach (TISpaceShipTemplate d in
+                         TemplateManager.IterateByClass<TISpaceShipTemplate>(true))
+                {
+                    if (d == null) continue;
+                    string display = Safe<string>(
+                        delegate { return d.displayName; }, null);
+                    if (string.Equals(display, name, StringComparison.Ordinal))
+                        return d.dataName;
+                }
+                return null;
+            }, null);
+        }
+
+        // Every entry on a design indexes one list, the hull's shipModuleSlots,
+        // whichever of the three arguments it arrived in: get_utilityModules,
+        // get_noseWeapons and get_hullWeapons all hand the entry's slot to
+        // ValidAssignedSlotForLocation, which indexes shipModuleSlots with it
+        // (IL_0016-IL_0032). Nothing in the engine notices two entries sitting
+        // on the same slot. The design saves and reads back valid, and which of
+        // the two parts the finished ship carries depends on the order its part
+        // lists happen to be read in, so the caller gets a ship that is not the
+        // one asked for.
+        static void RefuseSlotCollisions(TIShipHullTemplate hull,
+            List<ModuleDataTemplateEntry> modules,
+            List<ModuleDataTemplateEntry> noseWeapons,
+            List<ModuleDataTemplateEntry> hullWeapons)
+        {
+            var taken = new Dictionary<int, string>();
+            ClaimSlots(taken, hull, modules, "modules", false);
+            ClaimSlots(taken, hull, noseWeapons, "nose_weapons", true);
+            ClaimSlots(taken, hull, hullWeapons, "hull_weapons", true);
+        }
+
+        static void ClaimSlots(Dictionary<int, string> taken,
+            TIShipHullTemplate hull, List<ModuleDataTemplateEntry> entries,
+            string key, bool weapon)
+        {
+            for (int i = 0; i < entries.Count; i++)
+            {
+                ModuleDataTemplateEntry e = entries[i];
+                // An empty name, the literal "Empty" and a name that resolves
+                // to no template are the three the engine's getters skip
+                // without a word, so they hold no slot. Dropped reports all
+                // three, and claiming a slot for one of them would refuse a
+                // design over an entry that was never going to be on it.
+                if (string.IsNullOrEmpty(e.moduleName)) continue;
+                if (string.Equals(e.moduleName, "Empty", StringComparison.Ordinal))
+                    continue;
+                TIShipPartTemplate part = ResolvePart(e.moduleName, weapon);
+                if (part == null) continue;
+
+                List<int> slots = OccupiedSlots(hull, part, e.slot);
+                string who = key + "[" + i + "] '" + e.moduleName + "' on slot "
+                    + e.slot + Spread(slots, MountName(part));
+                for (int s = 0; s < slots.Count; s++)
+                {
+                    string other;
+                    if (taken.TryGetValue(slots[s], out other))
+                        throw new VerbError("slot " + slots[s] + " is claimed "
+                            + "twice: by " + other + ", and by " + who + ". All "
+                            + "three entry lists index the same hull "
+                            + "shipModuleSlots list, and the engine saves a "
+                            + "design with two parts on one slot without a "
+                            + "word, so which one the finished ship carries "
+                            + "depends on the order its part lists are read in. "
+                            + "Nothing was created");
+                    taken[slots[s]] = who;
+                }
+            }
+        }
+
+        // Which slots the part actually holds. ValidAssignedSlotForLocation
+        // reads the part's ref_weapon and switches on its mount
+        // (IL_003c-IL_0053). A part that is not a weapon, and a weapon on a
+        // single-slot mount, takes the slot named and no more. The four hull
+        // mounts TwoHullHoriz through FourHull and the four nose mounts
+        // TwoNoseHoriz through FourNose go down the other arm (IL_0098), which
+        // walks hullTemplate.ValidBigWeaponSlotSets(mount) and accepts the
+        // entry only where the entry's slot is the slotIndex of the set's FIRST
+        // element (IL_00b9-IL_00cc). A set is keyed on its first slot, and the
+        // weapon on it occupies every slot in the set.
+        //
+        // A big weapon whose slot keys no set is left holding its own slot
+        // here. The engine drops such an entry and Dropped reports that;
+        // expanding it to a set it does not key would name the wrong fault.
+        static List<int> OccupiedSlots(TIShipHullTemplate hull,
+            TIShipPartTemplate part, int slot)
+        {
+            var slots = new List<int>();
+            slots.Add(slot);
+            try
+            {
+                TIShipWeaponTemplate weapon = part.ref_weapon;
+                if (weapon == null) return slots;
+                if (!BigMount(weapon.mount)) return slots;
+                foreach (var set in hull.ValidBigWeaponSlotSets(weapon.mount))
+                {
+                    if (set == null || set.Count == 0) continue;
+                    if (hull.slotIndex(set[0]) != slot) continue;
+                    for (int i = 1; i < set.Count; i++)
+                    {
+                        int other = hull.slotIndex(set[i]);
+                        if (other >= 0 && !slots.Contains(other)) slots.Add(other);
+                    }
+                    break;
+                }
+            }
+            // A read off the hull or the part that throws leaves the entry
+            // holding its own slot. No VerbError is raised inside this block,
+            // so a refusal above is never swallowed here.
+            catch (Exception) { }
+            return slots;
+        }
+
+        // The two ranges ValidBigWeaponSlotSets answers for: mounts
+        // TwoHullHoriz through FourHull over the hull hard points, TwoNoseHoriz
+        // through FourNose over the nose hard points. Every other mount value
+        // falls past both tests to the empty list (IL_0006-IL_0013).
+        static bool BigMount(Mount mount)
+        {
+            return (mount >= Mount.TwoHullHoriz && mount <= Mount.FourHull)
+                || (mount >= Mount.TwoNoseHoriz && mount <= Mount.FourNose);
+        }
+
+        static string MountName(TIShipPartTemplate part)
+        {
+            return Safe<string>(delegate
+            {
+                TIShipWeaponTemplate weapon = part.ref_weapon;
+                return weapon != null ? weapon.mount.ToString() : null;
+            }, null);
+        }
+
+        // Said only when the entry holds more than the slot it named, which is
+        // the big-weapon case: the refusal has to explain where the other slots
+        // came from.
+        static string Spread(List<int> slots, string mount)
+        {
+            if (slots.Count < 2) return "";
+            var text = new List<string>();
+            for (int i = 0; i < slots.Count; i++)
+                text.Add(slots[i].ToString(CultureInfo.InvariantCulture));
+            return " (a " + (mount != null ? mount : "multi-slot")
+                + " mount, which holds slots "
+                + string.Join(", ", text.ToArray()) + ")";
         }
 
         #endregion

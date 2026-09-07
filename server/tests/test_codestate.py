@@ -25,6 +25,8 @@ SERVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: E402,F401
 import bridge                                       # noqa: E402
 import codestate                                    # noqa: E402
 import compose                                      # noqa: E402
@@ -331,6 +333,18 @@ class ObserveTest(Sandbox):
 
 class DispatchTest(Sandbox):
     """handle_call pins late imports and turns _failed into a tool error."""
+
+    def setUp(self):
+        Sandbox.setUp(self)
+        # handle_call takes a stall reading and a campaign token before it
+        # dispatches, both through compose.bridge. Left real, they read
+        # whatever game is running on this machine: a campaign parked past the
+        # pause limit answers every case below with the PAUSE LIMIT banner in
+        # place of the payload the case built. The stand-in reports nothing to
+        # measure, which is what the gate needs to let the call through.
+        patch = mock.patch.object(compose, "bridge", _offline.DispatchBridge())
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def call(self, payload):
         with mock.patch.dict(tools.BY_NAME,

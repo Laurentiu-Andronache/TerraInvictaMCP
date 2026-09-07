@@ -27,6 +27,8 @@ SERVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: E402,F401
 import compose                                      # noqa: E402
 import tools                                        # noqa: E402
 

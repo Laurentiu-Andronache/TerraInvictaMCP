@@ -69,6 +69,11 @@ namespace TerraInvictaMCP
             // The launch is asynchronous, so the seat is read by the tick once
             // the new campaign reports itself loaded.
             ForgetSeat();
+            // Nor anything armed or recorded against it. Combat ids start again at
+            // the same numbers this process already used, so a record left by the
+            // last campaign would answer for a fight in this one that has not
+            // happened yet.
+            ResetCampaignRunState();
 
             // Same call the "start campaign" button makes: default campaign options, then
             // the scene load that builds the new gamestate.
@@ -158,18 +163,13 @@ namespace TerraInvictaMCP
 
             // Anything armed against the campaign now being unloaded must not act
             // on the next one. State ids are reused across campaigns, which is the
-            // same reason saves.load clears these.
-            runUntilTarget = null;
-            runUntilText = null;
-            clockParkedByDriver = false;
-            Disarm();
-            autoError = null;
-            autoNote = null;
+            // same reason saves.load clears these, and this verb answers frames
+            // before the engine reports the campaign gone.
+            ResetCampaignRunState();
             // The engagement patches isActivePlayer for one faction of one
             // campaign. That campaign is about to stop existing.
             o["aiControlReleased"] = AiControl.Engaged;
             AiControl.ReleaseForCampaignEnd();
-            AiControl.ResetMissionPhaseCollisions();
             // The latched seat belongs to the campaign being unloaded. The tick
             // latches the next one when a campaign is up again.
             ForgetSeat();
@@ -1554,11 +1554,41 @@ namespace TerraInvictaMCP
             try { options = notices.optionButtons; }
             catch (Exception) { }
 
+            // Whether the box on screen is a narrative event box at all, which decides
+            // whether the controller's record describes it. PushNextAlert branches on
+            // the queue item's narrativeEventAlert (IL_0446) and the two sides part ways
+            // over this panel: the narrative side turns it on (IL_04a7) one instruction
+            // after writing currentNarrativeEvent (IL_04a2), and both non-narrative sides
+            // turn it off (IL_0585, IL_0666). That stfld is the record's only writer and
+            // nothing ever clears it, so on a plain notification box the record still
+            // names the last story event answered. Reading the panel is what keeps that
+            // stale name out of this reply.
+            //
+            // Three answers rather than two, because the panel object can be null and
+            // that is not the same as a panel that is off. A build that renames or
+            // drops the field, or a controller read before its references are wired,
+            // leaves a null behind while a real story event is on screen, and
+            // reporting that as a notification box is a claim the reading cannot
+            // support. So a null is unknown, and the press below refuses on it the
+            // way it refuses on a panel that is off: a box that cannot be shown to
+            // belong to the event a press would answer is not one to press.
+            UnityEngine.GameObject panel = Safe<UnityEngine.GameObject>(
+                delegate { return notices.narrativeEventButtonsPanel; }, null);
+            bool panelKnown = panel != null;
+            bool narrativeBox = panelKnown
+                && Safe<bool>(delegate { return panel.activeInHierarchy; }, false);
+            o["narrativeBox"] = panelKnown
+                ? (JToken)new JValue(narrativeBox) : JValue.CreateNull();
+            if (!panelKnown)
+                o["narrativeBoxNote"] = "the controller's option-button panel could not "
+                    + "be read, so whether this box is a narrative event box is unknown; "
+                    + "no event is reported for it and a press is refused";
+
             // The controller's record of the event this box is showing, read once and
             // used twice: by detail below, and by the press further down, which has to
             // read it BEFORE pressing because the press is what destroys it.
-            CurrentNarrativeEventData current;
-            bool haveEvent = CurrentNarrativeEvent(notices, out current);
+            CurrentNarrativeEventData current = new CurrentNarrativeEventData();
+            bool haveEvent = narrativeBox && CurrentNarrativeEvent(notices, out current);
             // The event behind this box, named off the controller's own record and
             // read here, before anything in this verb presses anything, because the
             // press is what destroys the record.
@@ -1569,7 +1599,8 @@ namespace TerraInvictaMCP
             // record's name is the authoritative one, because it survives a template
             // this build cannot resolve -- which is exactly the case detail has to
             // report on -- and the key now means the same thing on every reply: the
-            // narrative event this box is showing, null when there is none.
+            // narrative event this box is showing, null when there is none. A plain
+            // notification box has none, whatever the controller's record still holds.
             string eventName = haveEvent
                 ? Safe<string>(delegate { return current.eventTemplateName; }, null)
                 : null;
@@ -1644,14 +1675,22 @@ namespace TerraInvictaMCP
             // reading the box can wait a poll instead of pressing into the window and
             // getting the refusal.
             o["pressLands"] = NarrativePressLands(notices);
-            if (detail)
+            if (detail && template == null)
             {
-                if (template == null)
-                    o["detailNote"] = haveEvent
-                        ? "no narrative event behind this box, so there is nothing to "
-                          + "detail: its buttons are a notification's, not an event's"
-                        : "the controller's narrative event record could not be read on "
-                          + "this build, so no option detail is available";
+                if (!panelKnown)
+                    o["detailNote"] = "no option detail: this build's notification "
+                        + "controller would not say whether the box is a narrative "
+                        + "event box (see narrativeBoxNote)";
+                else if (!narrativeBox)
+                    o["detailNote"] = "no narrative event behind this box, so there is "
+                        + "nothing to detail: its buttons are a notification's, not an "
+                        + "event's";
+                else if (haveEvent)
+                    o["detailNote"] = "the narrative event on this box does not resolve "
+                        + "to a template in this build, so no option detail is available";
+                else
+                    o["detailNote"] = "the controller's narrative event record could not "
+                        + "be read on this build, so no option detail is available";
             }
 
             int pick = OptionalInt(args, "option");
@@ -1676,6 +1715,30 @@ namespace TerraInvictaMCP
                         "pressed and the event stands unanswered",
                         "alert.choose without `option` still reads the box, "
                         + "`detail` included");
+                // A press is only ever an answer to a narrative event. Every path
+                // through OnOptionButtonPressed past its guard reads
+                // currentNarrativeEvent and runs a SelectNarrativeEventOption with
+                // the index pressed, and nothing ever clears that record -- so a
+                // press on a box that is not a narrative box answers the last story
+                // event the campaign saw, which is not on screen and not what the
+                // caller is looking at. This used to press and then report
+                // `answered: false`, which described the box rather than what the
+                // press did.
+                //
+                // The unknown case is refused for the same reason and not a weaker
+                // one: a panel that cannot be read is a box that cannot be shown to
+                // belong to the event the press would answer.
+                if (!narrativeBox)
+                    throw new VerbError(panelKnown
+                        ? "this box is a notification rather than a narrative event "
+                            + "(its option-button panel is off), and a press on it "
+                            + "would answer the last narrative event the controller "
+                            + "recorded, which is not this box. Nothing was pressed; "
+                            + "prompts.dismiss closes a notification through its own "
+                            + "okay button"
+                        : "the controller's option-button panel could not be read, so "
+                            + "this box cannot be shown to be the narrative event a "
+                            + "press would answer. Nothing was pressed");
                 if (options == null || pick >= options.Length || !Clickable(options[pick]))
                     throw new VerbError("option " + pick + " is not clickable");
                 if (!NarrativePressLands(notices))

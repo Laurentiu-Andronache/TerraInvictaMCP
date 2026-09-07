@@ -24,6 +24,8 @@ in its own change.
 import os
 import unittest
 
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: F401
 import _fixtures
 from _fixtures import OMIT, modcheck
 

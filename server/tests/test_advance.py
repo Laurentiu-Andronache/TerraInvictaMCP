@@ -23,6 +23,8 @@ SERVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: E402,F401
 import bridge                                       # noqa: E402
 import compose                                      # noqa: E402
 import tools                                        # noqa: E402
@@ -329,7 +331,8 @@ class FakeBridge:
     def verbs(self, refresh=False):
         return {"ping", "query.time", "prompts.dismiss", "combat.status",
                 "combat.autoresolve", "query.autopilot", "saves.list",
-                "saves.load", "alert.choose", "campaign.new", "time.play",
+                "saves.load", "saves.save", "alert.choose", "campaign.new",
+                "time.play",
                 "time.speed", "time.run_until", "time.pause", "ai.control"}
 
     def call(self, verb, args=None, timeout=None):
@@ -349,17 +352,19 @@ class FakeBridge:
             reply = {"date": self.date.isoformat(), "blocked": self.blocked,
                      "paused": False, "speed": 5, "crashed": crashed}
             if self.phase_key:
-                active = (self.polls <= self.phase_polls
-                          or (self.phase_from is not None
-                              and self.polls >= self.phase_from))
                 reply["missionPhase"] = {
-                    "active": active,
+                    "active": self._phase_open(),
                     "prepping": False, "planning": False, "collisions": 0}
             return reply
         if verb == "time.run_until":
             self.run_until_args.append(args)
             if self.arm_error is not None:
                 raise self.arm_error
+            if self._refuses_the_arm(args):
+                raise bridge.VerbError(
+                    "mission_phase: a mission phase is open (missionPhase "
+                    '{"active":true}), and arming a new run_until target '
+                    "hands the clock back into it")
             return {"armed": True, "alreadyArmed": False,
                     "target": (args or {}).get("date")}
         if verb == "ai.control":
@@ -377,6 +382,11 @@ class FakeBridge:
             return self.autopilot if self.autopilot is not None else {}
         if verb == "saves.list":
             return self.saves if self.saves is not None else []
+        if verb == "saves.save":
+            # The reply names the file written; the extension the game
+            # appends is a profile setting, so the server reads it off this
+            # path rather than assuming one.
+            return {"path": "/saves/%s.gz" % (args or {}).get("name")}
         if verb == "alert.choose":
             if self.alert_from is not None and self.polls < self.alert_from:
                 return {"open": False}
@@ -386,6 +396,31 @@ class FakeBridge:
                     "options": [{"option": 0, "label": "Acknowledge"}]}
         return {}
 
+    def _phase_open(self):
+        """The phase state this poll's query.time reported."""
+        if not self.phase_key:
+            return False
+        return (self.polls <= self.phase_polls
+                or (self.phase_from is not None
+                    and self.polls >= self.phase_from))
+
+    def _refuses_the_arm(self, args):
+        """What the DLL does with a new target over an open mission phase.
+
+        Refused, unless the caller forced it or an ai.control engagement is
+        deferring the colliding tick. Modelled here rather than left out: the
+        server exempts an engaged run from its own hold, so an arm the DLL
+        refused anyway would leave that run with the clock down and nothing
+        that ever re-arms it -- and a fake that always armed could not tell
+        the two apart. `phase_key` false is a DLL from before any of this,
+        which refuses nothing.
+        """
+        if not self._phase_open():
+            return False
+        if (args or {}).get("force"):
+            return False
+        return not self.engaged
+
     def count(self, verb):
         return self.calls.count(verb)
 
@@ -394,6 +429,16 @@ class FakeBridge:
         # limit answers. These cases are about the loop, not about the limit;
         # test_pause_limit subclasses this with a stall.
         return None, 0.0
+
+    def last_campaign_token(self):
+        # One campaign for the whole of a case. Answered rather than left off,
+        # so a case driven through tools.handle_call reaches the campaign
+        # check instead of having it swallowed as a missing attribute.
+        return "fake-1"
+
+    def last_campaign_process(self):
+        # One game process for the whole of a case, for the same reason.
+        return "fake"
 
 
 def _no_sleep(case):
@@ -423,7 +468,11 @@ def _fresh_run_state(case):
     """
     saved = dict(compose._RUN)
     compose._RUN.update({"zeroCalls": 0, "zeroReasons": [],
-                         "crashRecoveries": 0, "macroOn": False})
+                         "crashRecoveries": 0, "crashRestarted": False,
+                         "macroOn": False,
+                         "campaignToken": None, "campaignAt": None,
+                         "save": None, "saveToken": None,
+                         "campaignPending": False, "entryProcess": None})
     case.addCleanup(compose._RUN.update, saved)
 
 
@@ -939,7 +988,11 @@ class MissionPhaseTest(unittest.TestCase):
 
     def test_an_engagement_skips_the_hold_entirely(self):
         # AiControl's own prefix defers a colliding tick while engaged, so the
-        # phase is guarded there and a hold would only stall the run.
+        # phase is guarded there and a hold would only stall the run. The
+        # fake refuses an arm over an open phase exactly as the DLL does, so
+        # this passes only because the DLL exempts an engagement too: with
+        # the refusal in place on both sides, an engaged run would arm
+        # nothing and hold a clock the engagement is trying to spend.
         digest, fake = self._run(phase_polls=99, engaged=True, max_seconds=20)
         self.assertEqual(fake.count("time.run_until"), 1)
         self.assertEqual(fake.count("time.pause"), 0)
@@ -1014,6 +1067,11 @@ class MissionPhaseTest(unittest.TestCase):
                 "the clock back into it"),
             max_seconds=20)
         self.assertEqual(fake.count("time.play"), 0)
+        # Nor the speed. time.speed 5 hands the clock back on its own -- the
+        # game runs at full speed with or without a target -- so sending it
+        # before the arm did the very thing the refusal exists to prevent,
+        # and the hold that followed was a hold over a running clock.
+        self.assertEqual(fake.count("time.speed"), 0)
         # The rest of the poll is a hold too: the clock goes down and the
         # dismiss pass still runs, since that is what closes a phase.
         self.assertGreaterEqual(fake.count("time.pause"), 1)
@@ -1169,6 +1227,36 @@ class LostPollTest(unittest.TestCase):
         self.assertEqual(digest["lostPolls"], 2)
         self.assertGreater(digest["daysAdvanced"], 0)
 
+    def test_a_run_of_lost_polls_ends_the_call(self):
+        # Each of them waited the full verb timeout, so five in a row is
+        # minutes of silence. Spending the rest of the budget on it reports a
+        # bridge that has stopped answering as a run that was going fine.
+        polls = tuple(range(2, 2 + compose.LOST_POLLS_MAX))
+        fake = FakeBridge(CLEAR, blocked=False, days_per_poll=1,
+                          timeout_polls=polls)
+        with mock.patch.object(compose, "bridge", fake):
+            digest = compose.advance({"days": 5, "max_seconds": 600})
+        self.assertEqual(digest["stopReason"], "bridge_lost")
+        self.assertEqual(digest["lostPolls"], compose.LOST_POLLS_MAX)
+        self.assertIn("observe", digest["next"])
+
+    def test_one_answered_poll_starts_the_count_again(self):
+        # The cap counts CONSECUTIVE silence. A busy main thread that answers
+        # in between is a game that is working, however many polls it lost.
+        polls = tuple(range(2, 2 + compose.LOST_POLLS_MAX - 1)) \
+            + tuple(range(3 + compose.LOST_POLLS_MAX,
+                          2 + 2 * compose.LOST_POLLS_MAX))
+        fake = FakeBridge(CLEAR, blocked=False, days_per_poll=1,
+                          timeout_polls=polls)
+        with mock.patch.object(compose, "bridge", fake):
+            digest = compose.advance({"days": 2, "max_seconds": 600})
+        self.assertEqual(digest["stopReason"], "reached")
+
+    def test_the_lost_poll_stop_counts_toward_the_stall_refusal(self):
+        # It hands the caller a digest, so the loop can go on calling; and
+        # nothing between calls makes a silent bridge answer.
+        self.assertIn("bridge_lost", compose.INERT_STOPS)
+
     def test_a_timeout_is_not_reported_as_the_game_being_down(self):
         def boom(args, progress=None):
             raise bridge.BridgeTimeout("no reply within 30s")
@@ -1301,6 +1389,13 @@ class CrashTest(unittest.TestCase):
         self.stops = []
         self.starts = []
         self.stop_works = True
+        # The run is playing a save it loaded, in a campaign it entered at a
+        # known moment. Both are what makes "a save of this run" answerable;
+        # without them the recovery has nothing it is entitled to reload.
+        compose._RUN["campaignAt"] = self.ENTERED
+        compose._RUN["save"] = {"name": "scratch-run", "extension": ".gz"}
+        compose._RUN["saveToken"] = "fake-1"
+        compose._RUN["campaignToken"] = "fake-1"
         self.fake = self._fake(crashed_from=3)
         self._patch("game_stop", self._stop)
         self._patch("game_start", self._start)
@@ -1324,8 +1419,16 @@ class CrashTest(unittest.TestCase):
         self.fake.down = False
         return {"launched": True}
 
-    SAVES = [{"name": "Autosave1", "mtime": "2026-08-30 10:00:00"},
-             {"name": "scratch-run", "mtime": "2026-08-31 09:00:00"}]
+    # The folder as a real one looks: an autosave of the campaign under test,
+    # a save this run loaded, and an autosave from BEFORE the run entered its
+    # campaign, which is another campaign's and must never be reloaded here.
+    ENTERED = "2026-08-30 08:00:00"
+    SAVES = [{"name": "Autosave1", "extension": ".gz",
+              "mtime": "2026-08-30 10:00:00"},
+             {"name": "scratch-run", "extension": ".gz",
+              "mtime": "2026-08-31 09:00:00"},
+             {"name": "Autosave2", "extension": ".gz",
+              "mtime": "2026-08-29 12:00:00"}]
 
     def _fake(self, **kw):
         return FakeBridge(CLEAR, blocked=False, days_per_poll=1,
@@ -1336,7 +1439,7 @@ class CrashTest(unittest.TestCase):
             return compose.advance(dict({"days": 60, "max_seconds": 600},
                                         **kw))
 
-    def test_a_crash_restarts_and_reloads_the_newest_save(self):
+    def test_a_crash_restarts_and_reloads_the_newest_save_of_this_run(self):
         digest = self._run()
         self.assertEqual(digest["stopReason"], "crash_recovered")
         self.assertTrue(digest["crash"]["recovered"])
@@ -1346,7 +1449,39 @@ class CrashTest(unittest.TestCase):
         self.assertIn(digest["crash"]["detectedAt"],
                       digest["crash"]["gameTimeLost"])
         self.assertEqual(len(self.stops), 1)
-        self.assertEqual(self.starts, [{"load": "scratch-run"}])
+        # The extension travels with the name. With both twins of a stem on
+        # disk a bare name resolves through the profile setting, which need
+        # not be the file whose mtime was just read.
+        self.assertEqual(self.starts,
+                         [{"load": "scratch-run", "extension": ".gz"}])
+
+    def test_an_autosave_of_an_older_campaign_is_never_reloaded(self):
+        # Autosave2 predates the campaign entry, so it belongs to some other
+        # run. It is also the ONLY save on disk here, which is exactly the
+        # case the old "newest save" picker got wrong: it would have restarted
+        # into a stranger's campaign and reported a recovery.
+        self.fake.saves = [self.SAVES[2]]
+        compose._RUN["save"] = None
+        digest = self._run()
+        self.assertEqual(digest["stopReason"], "crashed")
+        self.assertFalse(digest["crash"]["recovered"])
+        self.assertEqual(self.starts, [])
+        self.assertIn("load_game", digest["next"])
+
+    def test_the_save_the_run_loaded_is_the_fallback(self):
+        # No autosave has been written since the campaign came up, which is
+        # every crash in the first minutes of a run.
+        self.fake.saves = [self.SAVES[1], self.SAVES[2]]
+        digest = self._run()
+        self.assertEqual(digest["stopReason"], "crash_recovered")
+        self.assertEqual(digest["crash"]["save"], "scratch-run")
+
+    def test_an_autosave_of_this_run_beats_the_save_it_loaded(self):
+        # The autosave is the newer of the two here, so it wins on mtime.
+        self.fake.saves = [dict(self.SAVES[0], mtime="2026-09-01 10:00:00"),
+                           self.SAVES[1]]
+        digest = self._run()
+        self.assertEqual(digest["crash"]["save"], "Autosave1")
 
     def test_a_process_that_survived_the_stop_is_not_a_recovery(self):
         # game_stop can report stopped:False on a leftover pid or a failed
@@ -1370,12 +1505,40 @@ class CrashTest(unittest.TestCase):
         self.assertIn("restart loop", digest["next"])
         self.assertEqual(len(self.starts), 1)
 
+    def test_a_spent_budget_never_claims_a_restart_that_did_not_run(self):
+        # The budget is spent when the attempt starts, so a recovery that
+        # died at the stop leaves it at the limit with nothing restarted.
+        # Saying "crashed again after an automatic restart" there describes
+        # a restart the run never had.
+        self.stop_works = False
+        self._run()
+        self.assertEqual(compose._RUN["crashRecoveries"], 1)
+        self.stop_works = True
+        digest = self._run()
+        self.assertEqual(digest["stopReason"], "crashed")
+        self.assertFalse(digest["crash"]["recovered"])
+        self.assertIn("restart loop", digest["next"])
+        self.assertNotIn("after an automatic restart", digest["next"])
+        self.assertEqual(self.starts, [])
+
+    def test_a_spent_budget_with_no_save_says_so_instead(self):
+        # A budget carried in from an earlier campaign is not the blocker
+        # here: there is nothing this run may reload, which is the fact the
+        # caller acts on.
+        self._run()
+        self.fake.saves = []
+        compose._RUN["save"] = None
+        digest = self._run()
+        self.assertEqual(digest["stopReason"], "crashed")
+        self.assertIn("no save OF THIS RUN", digest["next"])
+        self.assertNotIn("after an automatic restart", digest["next"])
+
     def test_no_save_means_stop_and_never_a_new_campaign(self):
         self.fake.saves = []
         digest = self._run()
         self.assertEqual(digest["stopReason"], "crashed")
         self.assertFalse(digest["crash"]["recovered"])
-        self.assertIn("no save to reload", digest["next"])
+        self.assertIn("no save OF THIS RUN", digest["next"])
         self.assertEqual(self.starts, [])
         self.assertEqual(self.stops, [])
 
@@ -1390,6 +1553,33 @@ class CrashTest(unittest.TestCase):
         compose._RUN["macroOn"] = True
         self._run()
         self.assertFalse(compose._RUN["macroOn"])
+
+    def test_a_terminal_crash_counts_toward_the_stall_refusal(self):
+        # The recovery that worked hands back a live game and clears the
+        # counter; the one that gave up hands back a digest saying to call
+        # again, and nothing this loop does between calls un-crashes a game.
+        self.assertIn("crashed", compose.INERT_STOPS)
+        self.assertNotIn("crash_recovered", compose.INERT_STOPS)
+        # Crashed at the door, so the call moved no days: a crash that
+        # arrived after a week of game time is not a fruitless call and
+        # clears the counter on the days alone.
+        self.fake.crashed_from = 1
+        self.fake.saves = []
+        for _ in range(compose.ZERO_PROGRESS_REFUSE - 1):
+            self.assertEqual(self._run()["stopReason"], "crashed")
+        with self.assertRaises(tools.ToolError):
+            self._run()
+
+    def test_a_recovery_clears_the_count_instead(self):
+        # One fruitless call behind it, which is under the refusal, and a
+        # crash at the door so this call moves no days either. The recovery
+        # is what clears the count, not the clock.
+        compose._RUN.update({"zeroCalls": 1, "zeroReasons": ["crashed"]})
+        self.fake.crashed_from = 1
+        digest = self._run()
+        self.assertEqual(digest["stopReason"], "crash_recovered")
+        self.assertEqual(digest["daysAdvanced"], 0)
+        self.assertEqual(compose._RUN["zeroCalls"], 0)
 
 
 class AutopilotMacroTest(unittest.TestCase):
@@ -1551,15 +1741,18 @@ class RunStateResetTest(unittest.TestCase):
         self.assertEqual(compose._RUN["zeroCalls"], 0)
         self.assertTrue(compose._RUN["macroOn"])
 
-    def test_game_start_resets_even_when_the_game_is_already_up(self):
+    def test_game_start_that_launches_nothing_keeps_the_macro(self):
         # The bridge answers, so this takes the no-launch branch and touches
-        # no process; the reset still has to happen.
+        # no process. The stall count is still dropped, but the macro is a
+        # live component in a process nothing replaced: clearing it here
+        # stopped advance polling query.autopilot, so a macro that had
+        # switched itself off went unnoticed for the rest of the run.
         fake = FakeBridge(CLEAR)
         with mock.patch.object(compose, "bridge", fake):
             out = compose.game_start({})
         self.assertFalse(out["launched"])
         self.assertEqual(compose._RUN["zeroCalls"], 0)
-        self.assertFalse(compose._RUN["macroOn"])
+        self.assertTrue(compose._RUN["macroOn"])
         self.assertEqual(compose._RUN["crashRecoveries"], 1)
 
     def test_campaign_new_resets(self):
@@ -1586,6 +1779,380 @@ class RunStateResetTest(unittest.TestCase):
             compose.campaign_new({"scenario": "2070Scenario"})
             digest = compose.advance({"days": 2, "max_seconds": 600})
         self.assertEqual(digest["stopReason"], "reached")
+
+
+class CampaignTokenTest(unittest.TestCase):
+    """The DLL names each campaign, and a name this server has not seen means
+    the campaign every counter here describes is gone.
+
+    The counters cannot notice that on their own. A campaign can be left and
+    started again entirely through the game's own screens -- the options
+    screen's exit, then the start screen -- with no verb of this server's
+    involved, and everything it remembers would go on describing a campaign
+    that no longer exists.
+    """
+
+    def setUp(self):
+        # The launch case below polls for the bridge every five seconds, and
+        # that wait is virtual here like every other in this file.
+        _no_sleep(self)
+        _fresh_run_state(self)
+        saved = dict(bridge._campaign)
+        self.addCleanup(bridge._campaign.update, saved)
+        bridge._campaign["token"] = None
+        bridge._campaign["process"] = None
+
+    def _seen(self, token):
+        """The token as it arrives: on an envelope, from any call."""
+        bridge._note_stall({"ok": True, "campaignToken": token})
+
+    def test_a_new_token_clears_the_zero_progress_count(self):
+        self._seen("a-1")
+        compose.note_campaign()
+        compose._RUN.update({"zeroCalls": 2,
+                             "zeroReasons": ["no_progress", "no_progress"]})
+        self._seen("a-2")
+        self.assertTrue(compose.note_campaign())
+        self.assertEqual(compose._RUN["zeroCalls"], 0)
+        self.assertEqual(compose._RUN["zeroReasons"], [])
+
+    def test_the_same_token_changes_nothing(self):
+        self._seen("a-1")
+        compose.note_campaign()
+        compose._RUN["zeroCalls"] = 2
+        self._seen("a-1")
+        self.assertFalse(compose.note_campaign())
+        self.assertEqual(compose._RUN["zeroCalls"], 2)
+
+    def test_the_macro_survives_a_campaign_change(self):
+        # The macro is a MonoBehaviour in a process nothing replaced, which is
+        # why load_game resets with keep_macro. Clearing it here would stop
+        # advance watching a macro that is still running.
+        compose._RUN["macroOn"] = True
+        self._seen("a-1")
+        compose.note_campaign()
+        self._seen("a-2")
+        compose.note_campaign()
+        self.assertTrue(compose._RUN["macroOn"])
+
+    def test_the_crash_budget_survives_a_campaign_change(self):
+        compose._RUN["crashRecoveries"] = 1
+        self._seen("a-1")
+        compose.note_campaign()
+        self._seen("a-2")
+        compose.note_campaign()
+        self.assertEqual(compose._RUN["crashRecoveries"], 1)
+
+    def test_an_old_dll_sends_no_token_and_nothing_happens(self):
+        compose._RUN["zeroCalls"] = 2
+        bridge._note_stall({"ok": True, "clockStall": 1.0})
+        self.assertFalse(compose.note_campaign())
+        self.assertEqual(compose._RUN["zeroCalls"], 2)
+
+    def test_a_load_binds_its_save_to_the_campaign_that_arrives(self):
+        fake = FakeBridge(CLEAR)
+        with mock.patch.object(compose, "bridge", fake):
+            compose.load_game({"name": "scratch-run"})
+        self.assertIsNone(compose._RUN["saveToken"])
+        self._seen("a-1")
+        compose.note_campaign()
+        self.assertEqual(compose._RUN["save"]["name"], "scratch-run")
+        self.assertEqual(compose._RUN["saveToken"], "a-1")
+
+    def test_a_campaign_nobody_ordered_drops_the_run_save(self):
+        # Options > Exit in game, then a campaign from the start screen. The
+        # save the run was playing belongs to the campaign that is gone, and
+        # a crash recovery reloading it would resume a different game.
+        fake = FakeBridge(CLEAR)
+        with mock.patch.object(compose, "bridge", fake):
+            compose.load_game({"name": "scratch-run"})
+        self._seen("a-1")
+        compose.note_campaign()
+        self._seen("a-2")
+        compose.note_campaign()
+        self.assertIsNone(compose._RUN["save"])
+        self.assertIsNone(compose._RUN["saveToken"])
+
+    def test_a_campaign_nobody_ordered_dates_itself_from_now(self):
+        self._seen("a-1")
+        compose.note_campaign()
+        # Nothing earlier is known about it, so only saves written from here
+        # on can be claimed as this run's.
+        self.assertIsNotNone(compose._RUN["campaignAt"])
+
+    def test_a_save_bound_to_another_campaign_is_not_re_bound(self):
+        # A save written in the campaign a load is replacing. The entry is
+        # ordered, so the campaign that arrives is the ordered one -- but the
+        # save is already bound to the campaign that is gone, and binding it
+        # here would have a crash recovery reload that other game.
+        self._seen("a-1")
+        compose.note_campaign()
+        compose._RUN["save"] = {"name": "old-campaign", "extension": ".gz"}
+        compose._RUN["saveToken"] = "a-1"
+        compose._RUN["campaignPending"] = True
+        self._seen("a-2")
+        compose.note_campaign()
+        self.assertIsNone(compose._RUN["save"])
+        self.assertIsNone(compose._RUN["saveToken"])
+
+    def test_a_launch_forgets_a_campaign_entry_that_never_arrived(self):
+        # The load was ordered and the game died during it, so the campaign
+        # never came up. Left standing, `campaignPending` promises that the
+        # NEXT campaign is the ordered one, and the save from the dead
+        # process would be bound to a campaign started by hand in the new one
+        # -- which a crash recovery would then reload.
+        compose._entered_campaign("scratch-run", ".gz")
+        ups = iter([False, True])
+        with mock.patch.object(compose, "_bridge_up",
+                               lambda: next(ups, True)), \
+                mock.patch.object(compose, "IS_WINDOWS", False), \
+                mock.patch.object(compose.subprocess, "Popen",
+                                  lambda *a, **kw: None):
+            out = compose.game_start({})
+        self.assertTrue(out["launched"])
+        self.assertIsNone(compose._RUN["save"])
+        self.assertFalse(compose._RUN["campaignPending"])
+        self.assertIsNone(compose._RUN["campaignAt"])
+        # And the campaign that does come up is nobody's ordered one.
+        self._seen("b-1")
+        compose.note_campaign()
+        self.assertIsNone(compose._RUN["save"])
+
+    def test_a_stop_forgets_it_too(self):
+        compose._entered_campaign("scratch-run", ".gz")
+        with mock.patch.object(compose, "IS_WINDOWS", False), \
+                mock.patch.object(compose, "_game_pids", lambda: []), \
+                mock.patch.object(compose, "_bridge_up", lambda: False):
+            compose.game_stop({})
+        self.assertIsNone(compose._RUN["save"])
+        self.assertFalse(compose._RUN["campaignPending"])
+        self._seen("b-1")
+        compose.note_campaign()
+        self.assertIsNone(compose._RUN["save"])
+
+    def test_an_ordered_entry_that_did_arrive_is_untouched(self):
+        # The control: nothing above may cost the ordinary load its binding.
+        fake = FakeBridge(CLEAR)
+        with mock.patch.object(compose, "bridge", fake):
+            compose.load_game({"name": "scratch-run"})
+        self._seen("b-1")
+        compose.note_campaign()
+        self.assertEqual(compose._RUN["save"]["name"], "scratch-run")
+        self.assertEqual(compose._RUN["saveToken"], "b-1")
+
+
+class CampaignProcessTest(unittest.TestCase):
+    """A game process nobody here replaced is still a game that was replaced.
+
+    game_start and game_stop forget the campaign entry for the processes this
+    server ends, and for a long time that was every process it knew of. It is
+    not: a person can close the game at the console and launch it again, which
+    is the ordinary way the Windows test machine gets a game at all. The entry
+    left behind promises that the next campaign token is the one this run
+    ordered, and carries a save file from a game that no longer exists.
+
+    The token cannot see it. Its counter restarts at 1 in every process, so
+    the first campaign of the replacement game answers a token this session
+    may already have handed out. The process key is what differs, and it
+    arrives on the first envelope of the new game, before any campaign is up.
+    """
+
+    def setUp(self):
+        _fresh_run_state(self)
+        saved = dict(bridge._campaign)
+        self.addCleanup(bridge._campaign.update, saved)
+        bridge._campaign["token"] = None
+        bridge._campaign["process"] = None
+
+    def _process(self, process):
+        """An envelope from a game with no campaign loaded."""
+        bridge._note_stall({"ok": True, "campaignProcess": process})
+
+    def _seen(self, token, process):
+        bridge._note_stall({"ok": True, "campaignToken": token,
+                            "campaignProcess": process})
+
+    def test_a_campaign_in_a_new_process_is_not_the_ordered_one(self):
+        self._process("aaa")
+        compose._entered_campaign("scratch-run", ".gz")
+        # A person relaunched the game and started a campaign from the start
+        # screen. Its token is the first of the new process, which says
+        # nothing about the entry ordered in the old one.
+        self._seen("bbb-1", "bbb")
+        compose.note_campaign()
+        self.assertIsNone(compose._RUN["save"])
+        self.assertIsNone(compose._RUN["saveToken"])
+        self.assertFalse(compose._RUN["campaignPending"])
+
+    def test_the_entry_is_forgotten_before_any_campaign_comes_up(self):
+        # The process key arrives with no campaign loaded, so the entry is
+        # gone before the start screen has been touched.
+        self._process("aaa")
+        compose._entered_campaign("scratch-run", ".gz")
+        self._process("bbb")
+        self.assertFalse(compose.note_campaign())
+        self.assertIsNone(compose._RUN["save"])
+        self.assertFalse(compose._RUN["campaignPending"])
+        self.assertIsNone(compose._RUN["campaignAt"])
+
+    def test_the_same_process_keeps_its_entry(self):
+        # The control. An in-process load is the ordinary case and must still
+        # bind its save to the campaign that arrives.
+        self._process("aaa")
+        compose._entered_campaign("scratch-run", ".gz")
+        self._seen("aaa-1", "aaa")
+        compose.note_campaign()
+        self.assertEqual(compose._RUN["save"]["name"], "scratch-run")
+        self.assertEqual(compose._RUN["saveToken"], "aaa-1")
+
+    def test_a_launch_of_our_own_keeps_the_entry_it_ordered(self):
+        # The trap in keying this on "the process changed since the last tool
+        # call": game_start replaces the process AND orders the entry, in that
+        # order and inside one call, so the next call would find a process it
+        # had not seen and throw away the entry the launch had just made --
+        # taking the save a crash recovery reloads with it. The entry is
+        # keyed on the process it was ordered IN, which is the new one.
+        self._process("aaa")
+        self._process("bbb")
+        compose._entered_campaign("scratch-run", ".gz")
+        self._seen("bbb-1", "bbb")
+        compose.note_campaign()
+        self.assertEqual(compose._RUN["save"]["name"], "scratch-run")
+        self.assertEqual(compose._RUN["saveToken"], "bbb-1")
+
+    def test_an_old_dll_sends_no_process_and_nothing_changes(self):
+        # No key on the envelope is no information, not a process that
+        # changed: the entry survives exactly as it did before this existed.
+        compose._entered_campaign("scratch-run", ".gz")
+        self._seen("aaa-1", None)
+        compose.note_campaign()
+        self.assertEqual(compose._RUN["save"]["name"], "scratch-run")
+        self.assertEqual(compose._RUN["saveToken"], "aaa-1")
+
+
+class WaitSecondsTest(unittest.TestCase):
+    """_wait_secs reads a wait argument that may be absent, a flag or a number.
+
+    The test it replaces was `value in (None, True, False)`, and bool is an
+    int in Python: 0 equals False and 1 equals True. So a caller asking for no
+    wait at all, or for a one-second one, was given the full default instead --
+    up to five minutes spent waiting by a call that asked not to.
+    """
+
+    def test_absent_takes_the_default(self):
+        self.assertEqual(compose._wait_secs(None, 300), 300)
+
+    def test_a_flag_takes_the_default_too(self):
+        # A boolean says "wait", not how long. int(True) is a one-second wait,
+        # which is a wait that always fails.
+        self.assertEqual(compose._wait_secs(True, 300), 300)
+        self.assertEqual(compose._wait_secs(False, 300), 300)
+
+    def test_a_number_is_the_callers_own(self):
+        self.assertEqual(compose._wait_secs(0, 300), 0)
+        self.assertEqual(compose._wait_secs(1, 300), 1)
+        self.assertEqual(compose._wait_secs(45, 300), 45)
+
+
+class RunSaveTest(unittest.TestCase):
+    """_run_save picks what a crash recovery may reload.
+
+    Never simply the newest save on disk: the folder holds other people's
+    campaigns and other runs of this harness, and restarting into one of those
+    resumes a game nobody asked for while reporting a recovery.
+    """
+
+    ENTERED = "2026-08-30 08:00:00"
+    OLD_AUTO = {"name": "Autosave", "extension": ".gz",
+                "mtime": "2026-08-29 12:00:00"}
+    NEW_AUTO = {"name": "Autosave", "extension": ".gz",
+                "mtime": "2026-08-30 10:00:00"}
+    COMBAT_AUTO = {"name": "CombatAutosave", "extension": ".gz",
+                   "mtime": "2026-08-30 11:00:00"}
+    EXIT = {"name": "ExitSave", "extension": ".gz",
+            "mtime": "2026-08-30 12:00:00"}
+    STRANGER = {"name": "Cooperatesave00053", "extension": ".gz",
+                "mtime": "2026-09-01 12:00:00"}
+    LOADED = {"name": "scratch-run", "extension": ".gz",
+              "mtime": "2026-08-30 07:00:00"}
+
+    def setUp(self):
+        _fresh_run_state(self)
+        compose._RUN["campaignAt"] = self.ENTERED
+
+    def _pick(self, rows):
+        fake = FakeBridge(CLEAR, saves=list(rows))
+        with mock.patch.object(compose, "bridge", fake):
+            return compose._run_save()
+
+    def test_an_autosave_of_this_campaign_qualifies(self):
+        self.assertEqual(self._pick([self.NEW_AUTO])["mtime"],
+                         self.NEW_AUTO["mtime"])
+
+    def test_an_autosave_from_before_the_campaign_does_not(self):
+        self.assertIsNone(self._pick([self.OLD_AUTO]))
+
+    def test_a_stranger_save_never_qualifies_however_new(self):
+        # Newest file in the folder by a day, and written while this run was
+        # going, and still not this run's: nothing here wrote it.
+        self.assertIsNone(self._pick([self.STRANGER]))
+
+    def test_the_combat_autosave_and_the_exit_save_count(self):
+        self.assertEqual(self._pick([self.COMBAT_AUTO])["name"],
+                         "CombatAutosave")
+        self.assertEqual(self._pick([self.EXIT])["name"], "ExitSave")
+
+    def test_the_loaded_save_qualifies_though_it_predates_the_entry(self):
+        # It has to: it was written before the load that entered the campaign.
+        compose._RUN["save"] = {"name": "scratch-run", "extension": ".gz"}
+        self.assertEqual(self._pick([self.LOADED, self.OLD_AUTO])["name"],
+                         "scratch-run")
+
+    def test_the_newest_qualifying_save_wins(self):
+        compose._RUN["save"] = {"name": "scratch-run", "extension": ".gz"}
+        rows = [self.LOADED, self.OLD_AUTO, self.NEW_AUTO, self.STRANGER]
+        self.assertEqual(self._pick(rows)["name"], "Autosave")
+
+    def test_the_twin_the_run_loaded_is_the_one_matched(self):
+        # Same stem, both formats on disk, and the older file is the .json.
+        # The recorded extension decides, not the mtime.
+        compose._RUN["save"] = {"name": "scratch-run", "extension": ".json"}
+        rows = [dict(self.LOADED, mtime="2026-08-30 07:30:00"),
+                dict(self.LOADED, extension=".json")]
+        self.assertEqual(self._pick(rows)["extension"], ".json")
+
+    def test_an_unknown_extension_falls_back_to_the_newer_twin(self):
+        # load_game without one. Which file the game read went through the
+        # profile setting and is not knowable from here, so the pick is the
+        # newer of the two, and the extension travels with it.
+        compose._RUN["save"] = {"name": "scratch-run", "extension": None}
+        rows = [self.LOADED, dict(self.LOADED, extension=".json",
+                                  mtime="2026-08-30 07:30:00")]
+        self.assertEqual(self._pick(rows)["extension"], ".json")
+
+    def test_a_run_that_never_entered_a_campaign_picks_nothing(self):
+        compose._RUN["campaignAt"] = None
+        self.assertIsNone(self._pick([self.NEW_AUTO, self.STRANGER]))
+
+    def test_an_empty_folder_picks_nothing(self):
+        self.assertIsNone(self._pick([]))
+
+
+class SaveGameRecordTest(unittest.TestCase):
+    """A save this run wrote is a save this run may come back to."""
+
+    def setUp(self):
+        _fresh_run_state(self)
+        compose._RUN["campaignToken"] = "a-1"
+
+    def test_save_game_records_the_file_it_wrote(self):
+        fake = FakeBridge(CLEAR)
+        with mock.patch.object(compose, "bridge", fake):
+            compose.save_game({"name": "scratch-topic"})
+        self.assertEqual(compose._RUN["save"],
+                         {"name": "scratch-topic", "extension": ".gz"})
+        # Bound to the campaign it was written in, not to the next one.
+        self.assertEqual(compose._RUN["saveToken"], "a-1")
 
 
 if __name__ == "__main__":

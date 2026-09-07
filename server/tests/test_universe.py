@@ -13,6 +13,8 @@ file gets, which file is replaced whole) lives in the reader, not the merge.
 import shutil
 import unittest
 
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: F401
 import _fixtures
 from _fixtures import modcheck
 

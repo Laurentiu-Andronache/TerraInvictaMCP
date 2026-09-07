@@ -44,9 +44,11 @@ answering it (see "Narrative events").
 ### The pause limit
 
 There is a limit on how long the game may go without gaining time: five
-minutes by default, whatever `pause_limit seconds=N` sets for the session, and
-none at all at `0`. `TIBRIDGE_PAUSE_LIMIT` sets the value the server starts
-with.
+minutes by default, whatever `set_pause_limit seconds=N` sets for the session,
+and none at all at `0`. `TIBRIDGE_PAUSE_LIMIT` sets the value the server starts
+with, and `pause_limit` reads the current one -- that read is never refused and
+never bannered, since it is what an agent calls to find out why everything else
+is being refused.
 
 Two things count as a stall, and the second is the one that surprises people:
 the clock not moving at all, and the clock crawling -- speed 1 or 2 with no
@@ -56,16 +58,31 @@ time buys a day of game time. Both are a test that is not running.
 Past the limit, every state-changing tool is refused with
 `PAUSE LIMIT EXCEEDED`, which names the state, the prompt holding the clock and
 how long since any verb ran. Read-only tools still run and lead their answer
-with that same banner, so reading a stopped campaign is never blocked; `raw`
-and `batch` run with the banner too. The tools that move the clock, clear what
-blocks it, or end and restart the run are never refused: `advance`, `time`
-(except `action=pause` and `speed=0`, which are a pause), `prompts`,
-`alert_choose`, the four `combat_*` tools, `autopilot`, `ai_autopilot`,
-`game_start`, `game_stop`, `main_menu`, `load_game`, `campaign_new`,
-`save_game`, `crash_the_game`. Those skip the stall reading altogether rather
-than taking one and ignoring it: a reading costs a `query.time`, and against
-the wedged main thread that `game_stop` exists to recover from a `query.time`
-costs the full bridge timeout.
+with that same banner, so reading a stopped campaign is never blocked. The
+tools that move the clock, clear what blocks it, or end and restart the run are
+never refused: `advance`, `time` (except `action=pause` and `speed=0`, which
+are a pause, in any spelling the wire allows), `prompts`, `alert_choose`, the
+four `combat_*` tools, `autopilot`, `ai_autopilot`, `game_start`, `game_stop`,
+`main_menu`, `load_game`, `campaign_new`, `save_game`, `crash_the_game`, and
+`set_pause_limit`, which is the way out of the limit itself. Those skip the
+stall reading altogether rather than taking one and ignoring it: a reading
+costs a `query.time`, and against the wedged main thread that `game_stop`
+exists to recover from a `query.time` costs the full bridge timeout.
+
+**`raw` and `batch` are judged by the verbs they carry.** Their own names say
+nothing about whether a call reads or writes, and taking them at their name let
+every refused write through under another spelling. A call whose every verb is
+a read runs with the banner: `query.*`, `assets.*`, `mods.list`,
+`harmony.patches`, `ui.screenshot`, `ui.tooltip`, `ui.describe`,
+`combat.status`, `prompts.list`, `saves.list`, `action.list`, `ping`, `verbs`
+and `version`. Anything else is refused exactly as the tool it stands in for
+would be, a verb the allowlist does not know included.
+
+A reading that cannot be taken refuses nothing. A `query.time` that fails
+leaves the limit with no measurement at all -- not the last one, which
+described a game that may since have died -- so a bridge that has gone away
+answers with its own error rather than a stall report, and no violation is
+recorded for it.
 
 What clears a stall is the game clock gaining time. Nothing else does: not a
 successful tool call, not a fixture, not a save. `advance` stops with
@@ -86,9 +103,10 @@ recognises, which is the clock sitting stopped between calls while an agent
 builds fixtures, thinks, or waits on something that is not coming.
 
 `observe` warns past half the limit, leads with the banner and the violation
-record past it, and always carries `stallSession`: the current limit and
-whether it is the default, `stallViolations` (one per stall episode, however
-many calls it refused), `refusedCalls`, `longestStallSeconds`, and the record
+record past it, and always carries `stallSession`: the current limit, whether
+it is the default, when it was last changed, `stallViolations` (one per stall
+episode, however many calls it refused), `refusedCalls`, `longestStallSeconds`,
+and the record
 taken when the limit was crossed -- time, state, blocking prompt, seconds since
 the last verb, and the first tool refused. An orchestrator reading `observe`
 after a run therefore sees a stall the run has since cleared. The DLL also
@@ -100,9 +118,10 @@ at a time is exactly the pattern the limit catches: it happens with the game
 paused, and none of it moves the clock. Either keep a setup sequence inside the
 limit, or call `advance days=1` between steps, which costs a second or two and
 clears the measurement. A setup that genuinely has to run with the clock
-stopped is a deliberate exception: `pause_limit seconds=<bigger>` for that
+stopped is a deliberate exception: `set_pause_limit seconds=<bigger>` for that
 session, and say in the report that it was raised. Every `observe` carries the
-current limit, so a raised one cannot pass unnoticed.
+current limit and the moment it last changed, so a raised one cannot pass
+unnoticed.
 
 **Read `daysAdvanced` before you read `next`.** Every digest ends by telling
 you to call again, and that sentence is worth obeying only when the last call
@@ -122,11 +141,18 @@ These stop reasons are not "ask for more time":
   `GameControl.handlingException` rather than guessing. Recovery is a process
   restart, because loading a save inside the same process does not clear the
   flag and comes back permanently degraded. `advance` does that restart once,
-  reloading the newest save and naming in the digest what was lost. A crash
-  that recurs after the restart stops rather than looping, and a crash with no
-  save to reload stops too: a fresh campaign is never started for you.
-  To test that this works rather than wait for a real crash, see
-  `crash_the_game` under "Testing mods".
+  reloading a save and naming in the digest what was lost. **The save it
+  reloads is the newest save OF THIS RUN**: an autosave, combat autosave or
+  exit save the game wrote after the run entered its campaign, and failing
+  that the save the run loaded (`load_game`, `game_start load=`, or the last
+  `save_game`). The newest save on disk is not a substitute -- the folder holds
+  other campaigns and other runs, and restarting into one of those resumes a
+  game nobody asked for while reporting a recovery. A run started with
+  `campaign_new` that crashes before its first autosave therefore has nothing
+  to come back to and stops with `crashed`, naming `load_game`; so does a
+  crash that recurs after the restart, rather than looping. A fresh campaign is
+  never started for you. To test that this works rather than wait for a real
+  crash, see `crash_the_game` under "Testing mods".
 - **`combat`** -- a fight the autoresolver will not retry. See "Combat" below.
 - **`autopilot_off`** -- the UI macro switched itself off. See "Autopilot and the
   faction AI".
@@ -149,7 +175,13 @@ These stop reasons are not "ask for more time":
   `prompts_refused` with the DLL's own text.
 - **`bridge_busy`** and **`bridge_lost`** -- the call ended on the transport
   rather than on the game. Busy is a stalled main thread and the game is up;
-  lost is a closed socket and it is not.
+  lost is a bridge that stopped answering, either a closed socket or five
+  clock reads in a row that went unanswered. Each of those waited the full
+  verb timeout, so a run of them is minutes of silence rather than a slow
+  poll, and the call stops instead of spending the rest of its budget on it.
+  `observe` is the next step for both: it reports whether the process is
+  still there, which is what tells a busy main thread from a game that is
+  gone.
 - **`pause_limit`** -- the game clock has gone past the pause limit without
   gaining time, so the call stopped rather than spending its budget on a clock
   that is not moving. The digest carries the violation record: state, blocking
@@ -169,18 +201,22 @@ These stop reasons are not "ask for more time":
   guard defers a colliding tick instead.
 
 Most of those hand you something to do and do not count toward the stall
-refusal. Four do: `mission_phase`, `pause_limit`, `active_player_moved` and
-`prompts_refused`, along with a call that ran out its budget having done
-nothing at all. A phase nothing here can close, a clock that has not moved in
-minutes, and a pass that will not run until the seat changes are all a game
-nobody is driving, and calling again over any of them without changing
-something is the loop the refusal exists to break.
+refusal. Six do: `mission_phase`, `pause_limit`, `active_player_moved`,
+`prompts_refused`, `bridge_lost` and a terminal `crashed`, along with a call
+that ran out its budget having done nothing at all. A phase nothing here can
+close, a clock that has not moved in minutes, a pass that will not run until
+the seat changes, a bridge that is not answering and a game that crashed again
+after its restart are all a game nobody is driving, and calling again over any
+of them without changing something is the loop the refusal exists to break.
+`crash_recovered` is the opposite case and clears the counter: the game came
+back and the next call has a live one to run.
 
 A bridge timeout during the loop is one lost poll, counted in `lostPolls`, not
-the end of the call. Verbs are answered on the game's main thread, so a large
-save, an asset load or a scene change stalls them past the 30s call budget with
-the process perfectly alive. A tool that times out says the game is UP and to
-wait; only a closed socket says to call `game_start`.
+the end of the call -- until five in a row, which ends it as `bridge_lost`.
+Verbs are answered on the game's main thread, so a large save, an asset load or
+a scene change stalls them past the 30s call budget with the process perfectly
+alive. A tool that times out says the game is UP and to wait; only a closed
+socket says to call `game_start`.
 
 ## Narrative events
 
@@ -268,7 +304,10 @@ precombat screen is up and nothing is autoresolving, so `combat_stance` is how
 to pick a different one. `advance` never reaches it: an unresolved combat sends
 that loop to `combat_autoresolve` before its prompt pass runs, and the machine
 submits the stance itself. Which is also why `combat_stance` is refused while
-`combat_autoresolve` is armed -- two writers on one screen.
+`combat_autoresolve` is armed -- two writers on one screen -- and why it is
+refused with the precombat canvas down: the controller outlives the screen and
+still holds the last fight, so a submit there answers a fight whose report has
+already been closed.
 
 The other prompt, `PromptBeginCombat`, is answered by nothing and never will
 be. Every button that clears it commits an outcome -- close, cancel, reject,
@@ -305,8 +344,11 @@ machine at the start, and two of its steps are one-shots: a second
 `AutoresolveSelected` raises a second precombat-complete event, and a second
 accept applies the same simulated damage to the real states again. So
 `combat_autoresolve` refuses a re-arm once either has fired, when the failure is
-one no retry changes, when the stall was in the closing phase, or after two
-attempts, and it names the combat, the phase it reached and the error.
+one no retry changes, when the stall was in the closing phase, and on a second
+attempt that recorded an error, and it names the combat, the phase it reached
+and the error. The attempt count on its own refuses nothing: a combat both
+sides of which turned out to be AI disarms cleanly with a note, and arming on
+that one again is harmless.
 `advance` stops on that rather than grinding to its budget.
 
 Nothing has ever reached the double-apply guard, and there is no point trying.
@@ -329,7 +371,12 @@ screen's own buttons. The prompt is left standing, the clock stays frozen and
 saving stays blocked. The DLL clears it when its machine finds the combat gone
 with no canvas left; the tool checks for it again afterwards and drops it, but
 **only with the canvas down**. While the canvas is up the prompt is not what
-freezes the clock.
+freezes the clock. Both readings the drop rests on -- the status and the screen
+-- have to have been read: a wait that ends on unanswered status polls, or a
+screen read that fails, reports `resolved: false` and leaves every prompt
+alone. `bridge_busy` there means the polls timed out with the game up, and the
+way back is another `combat_autoresolve` on the same combat, which re-enters the
+wait without arming anything a second time.
 
 Two things make a combat vanish like that, and the report says which.
 `promotionAtArming` is the promotion gate above, snapshotted when the machine
@@ -502,6 +549,11 @@ substring in dictionary order. Always use exact command names. Some
 commands print nothing on success. Selection-dependent commands (`addtrait`,
 `killstate`, ...) need `select=<state id>` in the same call.
 
+Past the pause limit the console is refused like any other write, and so is
+`raw cmd=console`, which is judged by the verb it carries: move the clock with
+`advance`, or take the limit off with `set_pause_limit seconds=0` and say in
+the report that you did.
+
 **`setfaction` is not safe while the game is running.** The seat it moves is
 the one the human UI's handlers read, and the faction AI keeps planning: its
 mission planner assigns through the map controller and kills the game there. It
@@ -617,9 +669,14 @@ seconds and fails loudly.
 - Run `modcheck` (the check that a mod's templates merged correctly into the
   game) from the main menu: merge, refs, locale, conflicts, reach.
 - Run `smoke_test` per scenario: campaign, advance, log scan. It returns to
-  the main menu between scenarios rather than relaunching the game. The log
-  scan counts an exception or an ERROR line as a failure, minus a small
-  allowlist of engine lines that are not one -- the NaN guards in
+  the main menu between scenarios rather than relaunching the game, and a
+  single named scenario does the same for itself when a campaign is loaded, so
+  it can be called from inside one. A game that goes down inside one scenario
+  is that scenario's row -- `bridge_lost`, or `bridge_busy` when the calls
+  timed out, with `reached` naming the step it died in -- rather than the end
+  of the sweep, and the next scenario relaunches the game before it starts.
+  The log scan counts an exception or an ERROR line as a failure, minus a
+  small allowlist of engine lines that are not one -- the NaN guards in
   `TISpaceShipTemplate.UnnormalizedTemplateSpaceCombatValue`, which substitute
   a fallback and carry on. The allowlist is printed in full on every run and
   what it swallowed is counted per row in `logNoiseIgnored`, so a pass can be
@@ -833,7 +890,10 @@ seconds and fails loudly.
   so the bridge answers the call normally from an already-crashed game. Use
   it to check that a client notices the crash and recovers. Recovery is the
   same as after a real crash, so `advance` does it for you: it restarts the
-  process, reloads the newest save and reports `crash_recovered`. By hand it
+  process, reloads the newest save of the run and reports `crash_recovered`.
+  Fire it on a campaign the run reached through `campaign_new` with no
+  autosave yet and the recovery has nothing it may reload, which is a
+  `crashed` stop rather than a failure. By hand it
   is `game_stop`, `game_start`, `load_game`. Either way anything unsaved is
   gone -- `save_game` first if the campaign is worth keeping. Without the
   exact `confirm` string the call is refused and nothing happens, so there

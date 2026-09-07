@@ -144,6 +144,26 @@ _verb_cache = None
 # absent, so an old DLL is asked once and then left alone.
 _stall = {"seconds": None, "at": None}
 
+# The campaign token from the last envelope that carried one. Minted by the
+# DLL, it changes on every transition into a campaign, so a client that never
+# ordered the transition still sees it: the in-game exit to the menu and a
+# campaign started from the start screen go through no verb of ours.
+#
+# None means no information -- no campaign loaded, or a DLL older than the key
+# -- and it is deliberately not remembered as a value. A campaign that ends
+# says nothing about which campaign comes next, and treating the gap as a
+# change would reset a run's counters twice for one swap.
+#
+# `process` is the token's prefix, sent on its own key by the DLL. It is minted
+# once at mod load, so it is the same string on every envelope a game process
+# ever sends and a different one from the next game. It is what tells a new
+# campaign from a new GAME: the counter behind the prefix restarts at 1 in each
+# process, so a token alone cannot say that the game was replaced by someone at
+# the console rather than by this server. Unlike the token it is carried
+# between campaigns too, since the process is there whether a campaign is or
+# not.
+_campaign = {"token": None, "process": None}
+
 
 def _note_stall(resp):
     if not isinstance(resp, dict):
@@ -152,6 +172,27 @@ def _note_stall(resp):
     ok = isinstance(value, (int, float)) and not isinstance(value, bool)
     _stall["seconds"] = float(value) if ok else None
     _stall["at"] = time.monotonic()
+    token = resp.get("campaignToken")
+    if isinstance(token, str) and token:
+        _campaign["token"] = token
+    process = resp.get("campaignProcess")
+    if isinstance(process, str) and process:
+        _campaign["process"] = process
+
+
+def last_campaign_token():
+    """The last campaign token seen on an envelope, or None if none ever was."""
+    return _campaign["token"]
+
+
+def last_campaign_process():
+    """The last process key seen on an envelope, or None if none ever was.
+
+    None is no information, the same way the token's None is: a DLL older than
+    the key never sends it, and a caller comparing it must not read the first
+    reading of a session as a process having changed.
+    """
+    return _campaign["process"]
 
 
 def clear_stall():

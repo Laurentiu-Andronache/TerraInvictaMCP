@@ -25,13 +25,17 @@ SERVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
+# Arms the guard that fails any case which would dial a running game.
+import _offline                                     # noqa: E402,F401
 import tools                                        # noqa: E402
 
 
 # The only writes that are not destructive. Each changes something the next
 # call can change back and no state a person could lose: the clock speed, the
-# camera, the screen that is open.
-REVERSIBLE_WRITES = frozenset(("time", "ui_view", "ui_screen"))
+# camera, the screen that is open, and this server's own pause limit, which
+# touches the game not at all.
+REVERSIBLE_WRITES = frozenset(("time", "ui_view", "ui_screen",
+                               "set_pause_limit"))
 
 # The five the issue named, listed by hand so the case still fails if the rule
 # above is ever loosened to accommodate them.

@@ -159,9 +159,13 @@ about the ones you cannot run.
   computed; the JSON-RPC read loop against malformed client messages; the
   bridge's failure paths and envelope contract against a loopback peer; the
   tool table's annotations; and save discovery in both formats the game
-  writes. It needs no game, no bridge and no game assemblies. CI runs it on
-  every PR. Some cases pin behavior that is wrong on purpose and say so.
-  Fixing one means changing its test in the same diff.
+  writes. It needs no game, no bridge and no game assemblies, and a guard
+  enforces that rather than leaving it to the port being closed:
+  `server/tests/_offline.py` raises on any connection to the bridge port,
+  every module in `server/tests/` imports it, and `test_offline_guard` fails
+  if a new one does not. CI runs it on every PR. Some cases pin behavior that
+  is wrong on purpose and say so. Fixing one means changing its test in the
+  same diff.
 - `python3 server/modcheck.py [check] [mod]` for changes to modcheck. It is the
   debug entry. It runs without an MCP client. It needs the game running for
   the checks that read live state.

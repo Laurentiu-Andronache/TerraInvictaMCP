@@ -129,8 +129,47 @@ def o(desc, req=False):
     return {"type": "object", "description": desc, "_req": req}
 
 
-def arr(desc, req=False):
-    return {"type": "array", "description": desc, "_req": req}
+def arr(desc, req=False, items=None):
+    schema = {"type": "array", "description": desc, "_req": req}
+    if items is not None:
+        schema["items"] = items
+    return schema
+
+
+# A design entry is {slot, name}, a fire mode is {slot, mode}, and an armor
+# facing is {material, value}. The bridge takes the integer token and nothing
+# else: it will not round 2.5 to 2 or read "3" as three, so a bare string in
+# one of these lists and a fractional slot are both errors with or without
+# these schemas. Stating the item shape has a validating client catch them
+# before the call is made, in a message that names the field instead of the
+# verb.
+DESIGN_ENTRY = {
+    "type": "object",
+    "properties": {
+        "slot": {"type": "integer",
+                 "description": "index into the hull's shipModuleSlots list"},
+        "name": {"type": "string", "description": "part template data name"}},
+    "required": ["slot", "name"],
+    "additionalProperties": False}
+
+FIRE_MODE_ENTRY = {
+    "type": "object",
+    "properties": {
+        "slot": {"type": "integer",
+                 "description": "index into the hull's shipModuleSlots list"},
+        "mode": {"type": "string", "description": "FireMode name"}},
+    "required": ["slot", "mode"],
+    "additionalProperties": False}
+
+ARMOR_FACING = {
+    "type": "object",
+    "properties": {
+        "material": {"type": "string",
+                     "description": "TIShipArmorTemplate data name"},
+        "value": {"type": "integer",
+                  "description": "armor points; clamped to what the hull holds"}},
+    "required": ["material", "value"],
+    "additionalProperties": False}
 
 
 # ---------------------------------------------------------------- local handlers
@@ -198,13 +237,15 @@ TOOLS = [
      "prompt names, combat, player faction. Call it first, and again whenever "
      "unsure; every answer names the next step, including when the game is "
      "down. Also reports the pause limit: a game clock that has not gained "
-     "time for %d s (pause_limit changes it) is a test failure, and past it "
+     "time for %d s (set_pause_limit changes it) is a test failure, and past "
+     "it "
      "every state-changing tool is refused. observe warns past half the limit, "
      "leads with PAUSE LIMIT EXCEEDED and the violation record past it, and "
-     "always carries stallSession -- the current limit, stallViolations "
-     "(stall episodes), refusedCalls, longestStallSeconds and the last "
-     "violation record -- so a stall the run has since cleared is still "
-     "readable afterwards." % compose.PAUSE_LIMIT_SECONDS,
+     "always carries stallSession -- the current limit, whether it is the "
+     "shipped default, when it was last changed, stallViolations (stall "
+     "episodes), refusedCalls, longestStallSeconds and the last violation "
+     "record -- so a stall the run has since cleared is still readable "
+     "afterwards." % compose.PAUSE_LIMIT_SECONDS,
      {}),
     ("game_start", compose.game_start, False, True,
      "Launch Terra Invicta via Steam and poll until the in-game bridge "
@@ -212,6 +253,8 @@ TOOLS = [
      "the campaign; wait_campaign=<seconds> waits without loading. No-op when "
      "the bridge is already up (still honors load).",
      {"load": s("save name to load once the bridge is up"),
+      "extension": s("which file, when both a .gz and a .json of that name "
+                     "exist; omit and the profile's own format wins"),
       "wait_campaign": i("seconds to wait for a campaign (default 300 when "
                          "load is given)")}),
     ("game_stop", compose.game_stop, False, True,
@@ -240,11 +283,16 @@ TOOLS = [
      "cause says stopReason no_progress rather than max_seconds, counts "
      "consecutive such calls across calls, and REFUSES the third in a row "
      "instead of re-arming (force=true runs it anyway, once the cause is "
-     "understood). Only those inert calls count: every stop below hands you "
-     "something to do and clears the counter instead. crashed and "
+     "understood). crash_recovered, combat, autopilot_off, "
+     "prompts_unreadable, decision and narrative_event hand you something to "
+     "do and clear the counter instead; mission_phase, pause_limit, "
+     "active_player_moved, prompts_refused, bridge_lost and a terminal "
+     "crashed count toward it, because calling again over any of them changes "
+     "nothing. The reasons themselves: crashed and "
      "crash_recovered (the game hit its crash handler; the run confirms the "
      "process died, restarts it and reloads the newest save once, then stops "
-     "rather than looping), combat (a fight the autoresolver will not retry "
+     "rather than looping, with a next that names game_start), combat (a "
+     "fight the autoresolver will not retry "
      "-- read combat_precombat action=status), autopilot_off (the autopilot "
      "macro switched itself off), prompts_unreadable (the queue could not be "
      "read, which is NOT the same as empty), pause_limit (the clock went past "
@@ -262,9 +310,12 @@ TOOLS = [
      "to answer through the human UI's handlers -- the digest names the "
      "faction to put back with setfaction, then call again), "
      "bridge_busy and bridge_lost (a "
-     "stalled main thread and a closed socket). A bridge timeout on the "
-     "per-poll clock read is one lost poll, counted in lostPolls, not the end "
-     "of the call. Needs a loaded campaign.",
+     "stalled main thread and a bridge that stopped answering; both name "
+     "observe as the next step). A bridge timeout on the per-poll clock read "
+     "is one lost poll, counted in lostPolls, not the end of the call -- but "
+     "%d unanswered in a row end it as bridge_lost, since each waited the "
+     "full verb timeout. Needs a loaded campaign."
+     % compose.LOST_POLLS_MAX,
      {"until": s("target date YYYY-MM-DD (or use days)"),
       "days": i("advance this many game days from now"),
       "answer_policy": s("'neutral' (default: skip real decisions) or 'all' "
@@ -583,28 +634,42 @@ TOOLS = [
       "force": b("arm run_until even with a mission phase open, accepting "
                  "the collision (default false)")}),
     ("pause_limit", compose.pause_limit_tool, True, False,
-     "Read or set the pause limit for this server session. The game clock not "
-     "gaining time for this many real seconds is a test failure: past it every "
-     "state-changing tool is refused with PAUSE LIMIT EXCEEDED, and read-only "
-     "tools answer with that banner in front. A clock crawling at speed 1 or 2 "
-     "with no run_until armed counts as stopped. seconds=0 disables the limit; "
-     "the default is %d and TIBRIDGE_PAUSE_LIMIT sets the starting value. Raise "
-     "it for a setup that genuinely has to run with the clock stopped, and say "
-     "in the report that it was raised -- every observe carries the current "
-     "limit and whether it is the default."
+     "Read the pause limit and this session's stall counters. The game clock "
+     "not gaining time for this many real seconds is a test failure: past it "
+     "every state-changing tool is refused with PAUSE LIMIT EXCEEDED, and "
+     "read-only tools answer with that banner in front. A clock crawling at "
+     "speed 1 or 2 with no run_until armed counts as stopped. The default is "
+     "%d and TIBRIDGE_PAUSE_LIMIT sets the starting value; set_pause_limit "
+     "changes it for the session. This read answers over a stalled clock "
+     "without the banner, since it is the reading an agent takes to find out "
+     "why everything else is being refused."
      % compose.PAUSE_LIMIT_SECONDS,
-     {"seconds": n("new limit in real seconds; 0 disables. Omit to read the "
-                   "current limit and the session's stall counters")}),
-    ("save_game", "saves.save", False, True,
+     {}),
+    ("set_pause_limit", compose.set_pause_limit_tool, False, False,
+     "Set the pause limit for the rest of this server session. seconds=0 "
+     "disables it entirely. Raise it for a setup that genuinely has to run "
+     "with the clock stopped, and say in the report that it was raised: every "
+     "observe carries the limit, whether it is the shipped default and when "
+     "it "
+     "was last changed, so a run that raised it cannot hide that it did. The "
+     "value is session state -- it lasts until this server process exits and "
+     "is written nowhere. Never refused by the limit itself, since it is the "
+     "way out of one.",
+     {"seconds": n("new limit in real seconds; 0 disables the limit",
+                   req=True)}),
+    ("save_game", compose.save_game, False, True,
      "Write a named save. Save a scratch name (scratch-<topic>) before "
-     "experimenting on a campaign a person is playing. Needs a loaded "
-     "campaign.",
+     "experimenting on a campaign a person is playing. The run remembers the "
+     "file, so a crash recovery reloads it rather than refusing for lack of "
+     "an autosave. Needs a loaded campaign.",
      {"name": s("save name", req=True)}),
     ("load_game", compose.load_game, False, True,
      "Load a save by name (works from the main menu -- the hands-off entry "
      "point). Tears the running session down; poll observe until "
      "campaign=true (20-60s). A bad name returns the save list.",
-     {"name": s("save name (ti://saves lists them)", req=True)}),
+     {"name": s("save name (ti://saves lists them)", req=True),
+      "extension": s("which file, when both a .gz and a .json of that name "
+                     "exist; omit and the profile's own format wins")}),
     ("campaign_new", compose.campaign_new, False, True,
      "Start a campaign from the main menu; refused while a campaign is loaded "
      "or a load is in flight. Returns loading:true -- poll observe until the "
@@ -755,13 +820,22 @@ TOOLS = [
       "tanks": i("propellant tank count, must be > 0 to validate", req=True),
       "role": s("ShipRole name, e.g. MS_Strike, Explorer, ArmyCarrier",
                 req=True),
-      "armor": o("{nose, lateral, tail}, each {material: TIShipArmorTemplate "
-                 "data name, value: armor points}", req=True),
-      "modules": arr("utility modules as [{slot, name}]"),
-      "nose_weapons": arr("nose hardpoint weapons as [{slot, name}]"),
-      "hull_weapons": arr("hull hardpoint weapons as [{slot, name}]"),
+      "armor": dict(o("{nose, lateral, tail}, each {material: "
+                      "TIShipArmorTemplate data name, value: armor points}",
+                      req=True),
+                    properties={"nose": ARMOR_FACING,
+                                "lateral": ARMOR_FACING,
+                                "tail": ARMOR_FACING},
+                    # All three, because ValidTemplate tests all three and a
+                    # missing facing fails it.
+                    required=["nose", "lateral", "tail"]),
+      "modules": arr("utility modules as [{slot, name}]", items=DESIGN_ENTRY),
+      "nose_weapons": arr("nose hardpoint weapons as [{slot, name}]",
+                          items=DESIGN_ENTRY),
+      "hull_weapons": arr("hull hardpoint weapons as [{slot, name}]",
+                          items=DESIGN_ENTRY),
       "fire_modes": arr("optional fire modes as [{slot, mode}], mode being a "
-                        "FireMode name"),
+                        "FireMode name", items=FIRE_MODE_ENTRY),
       "save": b("register the design with the faction (default true)"),
       "legal": b("refuse the save when a part needs research the faction has "
                  "not done (default true)")}),
@@ -910,7 +984,14 @@ TOOLS = [
      "combat that already failed is NOT armed again once a one-shot has "
      "fired on it (a second accept would apply the same simulated damage "
      "twice), once the failure is one no retry changes, or after two "
-     "attempts. Needs a loaded campaign.",
+     "attempts that recorded an error. A wait whose status polls stop being "
+     "answered ends with resolved false and touches no prompt: with nothing "
+     "read, a standing begin-combat prompt cannot be told from one a live "
+     "fight is waiting on. The stop reason is bridge_busy when every "
+     "unanswered poll timed out (the main thread is slow, the game is up; "
+     "call combat_autoresolve again on the same combat to go back to "
+     "waiting, which does not arm a second time) and bridge_lost otherwise. "
+     "Needs a loaded campaign.",
      {"combat": i("combat id; defaults to the active one"),
       "stance": s("player-side stance: Pursue, Defend, or Evade"),
       "wait": b("wait for the resolution (default true); false arms and "
@@ -945,7 +1026,9 @@ TOOLS = [
      "submit takes both from the screen and only the stance from its caller, "
      "so anything else would report a success it never made. The stance is "
      "checked against what the combat allows for that faction and refused by "
-     "name if it is not among them. Refused while combat_autoresolve is "
+     "name if it is not among them. Refused with the precombat canvas down, "
+     "since the button being pressed is on it and the screen behind it may "
+     "still hold a finished fight, and refused while combat_autoresolve is "
      "armed, which submits the stance itself a step per frame. The reply "
      "reads the stance back off the combat and reports whether the stance "
      "prompt left the queue. The OTHER precombat prompt, PromptBeginCombat, "
@@ -983,9 +1066,18 @@ TOOLS = [
     ("smoke_test", compose.smoke_test, False, True,
      "Per-scenario acceptance composite: start the campaign, wait, advance "
      "N game days (default 3), scan both logs for new exceptions. Without "
-     "scenario: every picker entry in turn, restarting the game between "
-     "them (slow -- minutes per scenario). Run from the main menu; "
-     "campaign_new refuses while a campaign is loaded.",
+     "scenario: every picker entry in turn, each one returned to the start "
+     "screen with main_menu before the next begins, in the same game process. "
+     "A menu return that will not complete, or a bridge that has gone, falls "
+     "back to a relaunch and the row says so in relaunchedBecause. A "
+     "scenario that loses the bridge is that scenario's row -- stopReason "
+     "bridge_lost, or bridge_busy when the calls timed out, with reached "
+     "naming the step -- and the sweep carries on, so one dead game does not "
+     "cost the scenarios after it. Every row carries newExceptions and "
+     "logNoiseIgnored, the failed rows included. Runs with a campaign "
+     "loaded: campaign_new is refused there, so a loaded campaign goes back "
+     "to the start screen first, for a named scenario as well as a sweep, "
+     "and the row that paid for it says returnedToMenu.",
      {"scenario": s("one scenario data name; default all picker entries"),
       "days": i("game days to advance per scenario, default 3")}),
     ("selftest", compose.selftest, True, False,
@@ -1083,11 +1175,19 @@ TOOLS = [
     ("batch", compose.batch, False, True,
      "Ordered bridge verbs in one call, fail-fast, per-step results -- "
      "fixture setup without N round trips. steps=[{cmd, args}, ...] using "
-     "raw verb names (ti://docs/protocol).",
+     "raw verb names (ti://docs/protocol). Past the pause limit it is judged "
+     "by the verbs it carries, not by its name: every step a read (query.*, "
+     "assets.*, and the named readers listed under raw) runs with the banner, "
+     "and anything else is refused like the tool it stands in for.",
      {"steps": arr("[{cmd: verb, args: {...}}, ...]", req=True)}),
     ("raw", raw_tool, False, True,
      "Escape hatch: send any bridge verb directly. Usable for new DLL verbs "
-     "before the tool table learns them. Verb reference: ti://docs/protocol.",
+     "before the tool table learns them. Verb reference: ti://docs/protocol. "
+     "Past the pause limit it is judged by the verb it carries: query.*, "
+     "assets.*, mods.list, harmony.patches, ui.screenshot, ui.tooltip, "
+     "ui.describe, combat.status, prompts.list, saves.list and version run "
+     "with the banner, and every other verb is refused, since a write does "
+     "not become safe over a stopped clock by being sent through here.",
      {"cmd": s("bridge verb name, e.g. query.state", req=True),
       "args": o("verb arguments")}),
     ("crash_the_game", compose.crash_the_game, False, True,
@@ -1184,6 +1284,16 @@ def handle_call(name, arguments, progress=None):
         refusal, banner = None, None
     if refusal:
         return tool_result(refusal, True)
+    # A campaign the server has not seen before invalidates the counters that
+    # describe the last one, and the transition need not have gone through a
+    # tool: the in-game exit to the menu and a campaign started from the start
+    # screen both reach one with no verb of ours involved. Guarded like the
+    # gate above -- a watchdog that breaks dispatch is worse than what it
+    # watches for.
+    try:
+        compose.note_campaign()
+    except Exception:
+        pass
     try:
         if isinstance(handler, str):
             data = call_verb(handler, args)
